@@ -1,4 +1,4 @@
-# responsive_image_example
+# responsive_image_view_example
 
 A new Flutter project.
 

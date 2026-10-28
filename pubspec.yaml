@@ -1,4 +1,4 @@
-name: responsive_image
+name: responsive_image_view
 description: "Network image widget that downloads once, downscales to S/M/L buckets by screen area and caches on disk."
 version: 0.0.1
 repository: https://github.com/baothg/responsive_image

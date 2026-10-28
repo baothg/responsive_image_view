@@ -7,8 +7,8 @@ import 'size_bucket.dart';
 
 /// Network image that is downloaded once, downscaled to a size bucket
 /// (S/M/L, by screen area share) and cached on disk.
-class ResponsiveImage extends StatefulWidget {
-  const ResponsiveImage(
+class ResponsiveImageView extends StatefulWidget {
+  const ResponsiveImageView(
     this.url, {
     super.key,
     this.width,
@@ -36,10 +36,10 @@ class ResponsiveImage extends StatefulWidget {
   final String? cacheKey;
 
   @override
-  State<ResponsiveImage> createState() => _ResponsiveImageState();
+  State<ResponsiveImageView> createState() => _ResponsiveImageViewState();
 }
 
-class _ResponsiveImageState extends State<ResponsiveImage> {
+class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   ImageRequest? _request;
   SizeBucket? _bucket;
   String? _loadedFor;

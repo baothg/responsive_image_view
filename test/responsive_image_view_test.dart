@@ -4,12 +4,12 @@ import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:responsive_image/src/disk_cache.dart';
-import 'package:responsive_image/src/downloader.dart';
-import 'package:responsive_image/src/image_hub.dart';
+import 'package:responsive_image_view/src/disk_cache.dart';
+import 'package:responsive_image_view/src/downloader.dart';
+import 'package:responsive_image_view/src/image_hub.dart';
 import 'package:image/image.dart' as img;
-import 'package:responsive_image/src/resizer.dart';
-import 'package:responsive_image/src/size_bucket.dart';
+import 'package:responsive_image_view/src/resizer.dart';
+import 'package:responsive_image_view/src/size_bucket.dart';
 
 class _FakeDownloader extends Downloader {
   int calls = 0, active = 0, maxActive = 0;

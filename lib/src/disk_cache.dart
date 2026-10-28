@@ -36,7 +36,7 @@ class DiskCache {
   }
 
   Future<Directory> get directory => _init ??= () async {
-        final d = _dir ?? Directory('${(await getTemporaryDirectory()).path}/responsive_image');
+        final d = _dir ?? Directory('${(await getTemporaryDirectory()).path}/responsive_image_view');
         await d.create(recursive: true);
         return _dir = d;
       }();

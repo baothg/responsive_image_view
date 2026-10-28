@@ -1,9 +1,9 @@
-# responsive_image
+# responsive_image_view
 
-A single widget, `ResponsiveImage`, that loads a network image at a size suited to its on-screen area.
+A single widget, `ResponsiveImageView`, that loads a network image at a size suited to its on-screen area.
 
 ```dart
-ResponsiveImage(
+ResponsiveImageView(
   'https://example.com/photo.jpg',
   width: 100,
   height: 100,
@@ -23,6 +23,6 @@ Platforms: Android, iOS.
 ## Install (git)
 ```yaml
 dependencies:
-  responsive_image:
+  responsive_image_view:
     git: https://github.com/baothg/responsive_image.git
 ```

@@ -43,7 +43,7 @@ class Resizer {
         inSampleSize: _sampleSize(source, target),
       );
     } catch (e) {
-      debugPrint('ResponsiveImage: native compress failed ($e), falling back to Dart');
+      debugPrint('ResponsiveImageView: native compress failed ($e), falling back to Dart');
     }
     final Uint8List out = bytes ?? await Isolate.run<Uint8List>(() => _dartResize(src.path, w, h, quality, source.width.round(), source.height.round()));
     final noResize = target == source;

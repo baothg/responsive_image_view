@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:responsive_image/responsive_image.dart';
+import 'package:responsive_image_view/responsive_image_view.dart';
 
 void main() => runApp(const MaterialApp(home: Demo()));
 
@@ -10,7 +10,7 @@ class Demo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    Widget img(int i, double w, double h, int sw, int sh) => ResponsiveImage(
+    Widget img(int i, double w, double h, int sw, int sh) => ResponsiveImageView(
           _url(i, sw, sh),
           width: w,
           height: h,
@@ -19,7 +19,7 @@ class Demo extends StatelessWidget {
           errorBuilder: (_, e) => const Icon(Icons.broken_image),
         );
     return Scaffold(
-      appBar: AppBar(title: const Text('ResponsiveImage')),
+      appBar: AppBar(title: const Text('ResponsiveImageView')),
       body: ListView(
         children: [
           img(1, double.infinity, 360, 4000, 3000),
