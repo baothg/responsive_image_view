@@ -124,13 +124,10 @@ class ImageHub {
   /// flash when a list item is rebuilt).
   File? peek(String url, SizeBucket bucket, {String? cacheKey}) {
     final id = _id(_keyOf(url, cacheKey), bucket);
-    final f = _known[id];
-    if (f == null) return null;
-    if (!f.existsSync()) {
-      _known.remove(id);
-      return null;
-    }
-    return f;
+    // The hub owns every write/delete, so entries always point at files it
+    // created. If the OS evicts tmp files, Image.file reports an error and
+    // the widget invalidates the entry and reloads.
+    return _known[id];
   }
 
   /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
