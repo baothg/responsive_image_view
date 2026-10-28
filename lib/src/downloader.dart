@@ -96,6 +96,9 @@ class Downloader {
         }),
       );
       await sink.close();
+      if (res.contentLength >= 0 && received != res.contentLength) {
+        throw const FileSystemException('Truncated download');
+      }
     } catch (_) {
       await sink.close().catchError((_) {});
       await target.delete().catchError((_) => target);

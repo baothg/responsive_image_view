@@ -6,8 +6,6 @@ import 'dart:convert';
 
 import 'package:path_provider/path_provider.dart';
 
-import 'size_bucket.dart';
-
 /// File based cache: one file per (image, bucket). Entry age = file mtime
 /// (creation time, never touched on read).
 class DiskCache {
@@ -66,12 +64,12 @@ class DiskCache {
     return _dir = d;
   }();
 
-  Future<File> fileFor(String key, SizeBucket b) async =>
-      File('${(await directory).path}/${key}_${b.name}.img');
+  Future<File> fileFor(String key, String variant) async =>
+      File('${(await directory).path}/${key}_$variant.img');
 
   /// Returns the cached file if present and not expired.
-  Future<File?> get(String key, SizeBucket b) async {
-    final f = await fileFor(key, b);
+  Future<File?> get(String key, String variant) async {
+    final f = await fileFor(key, variant);
     try {
       final stat = await f.stat();
       if (stat.type != FileSystemEntityType.file) return null;
@@ -86,8 +84,8 @@ class DiskCache {
   }
 
   /// Atomically stores [bytes].
-  Future<File> put(String key, SizeBucket b, List<int> bytes) async {
-    final f = await fileFor(key, b);
+  Future<File> put(String key, String variant, List<int> bytes) async {
+    final f = await fileFor(key, variant);
     final tmp = File('${f.path}.tmp');
     await tmp.writeAsBytes(bytes, flush: true);
     return tmp.rename(f.path);

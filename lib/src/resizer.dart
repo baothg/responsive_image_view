@@ -16,6 +16,15 @@ class UnsupportedImageException implements Exception {
   String toString() => 'UnsupportedImageException: $message';
 }
 
+/// The encoded output's dimensions do not match what was requested — almost
+/// always a truncated download that decoded as a partial/tiny bitmap.
+class CorruptImageException implements Exception {
+  CorruptImageException(this.message);
+  final String message;
+  @override
+  String toString() => 'CorruptImageException: $message';
+}
+
 /// Downscales (never upscales) and recompresses images.
 /// Native encoder (WebP) first, pure Dart (`image`) fallback.
 class Resizer {
@@ -75,7 +84,27 @@ class Resizer {
         );
     final noResize = target == source;
     if (noResize && out.length >= await src.length()) return src.readAsBytes();
+    if (!noResize) await _expectSize(out, target);
     return out;
+  }
+
+  Future<void> _expectSize(Uint8List out, ui.Size target) async {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(out);
+    ui.Size got;
+    try {
+      final d = await ui.ImageDescriptor.encoded(buffer);
+      got = ui.Size(d.width.toDouble(), d.height.toDouble());
+      d.dispose();
+    } catch (e) {
+      throw CorruptImageException('undecodable output: $e');
+    } finally {
+      buffer.dispose();
+    }
+    if (got.width * got.height < target.width * target.height * 0.5) {
+      throw CorruptImageException(
+        'decoded ${got.width.round()}x${got.height.round()}, expected ${target.width.round()}x${target.height.round()}',
+      );
+    }
   }
 }
 
@@ -96,7 +125,9 @@ Uint8List _dartResize(String path, int w, int h, int quality, int sw, int sh) {
   var image = img.decodeImage(File(path).readAsBytesSync());
   if (image == null) throw const FormatException('Unsupported image');
   image = img.bakeOrientation(image);
-  if (w < sw || h < sh) {
+  // Compare against the *decoded* size, not the header: a truncated source
+  // decodes smaller than declared and must not be upscaled to mask it.
+  if (w < image.width || h < image.height) {
     image = img.copyResize(
       image,
       width: w,

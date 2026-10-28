@@ -1,15 +1,17 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:ui';
 
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:responsive_image_view/responsive_image_view.dart';
 import 'package:responsive_image_view/src/disk_cache.dart';
 import 'package:responsive_image_view/src/downloader.dart';
 import 'package:responsive_image_view/src/image_hub.dart';
 import 'package:image/image.dart' as img;
 import 'package:responsive_image_view/src/resizer.dart';
-import 'package:responsive_image_view/src/size_bucket.dart';
+import 'package:responsive_image_view/src/size_bucket.dart'
+    show BucketScheme, SizeTier;
 
 class _FakeDownloader extends Downloader {
   int calls = 0, active = 0, maxActive = 0;
@@ -25,6 +27,27 @@ class _FakeDownloader extends Downloader {
     await Future<void>.delayed(const Duration(milliseconds: 20));
     await target.writeAsBytes([1, 2, 3]);
     active--;
+  }
+}
+
+/// Writes a valid but 1-pixel image, like a truncated JPEG would decode.
+/// Claims 4000x3000 from the header while the file decodes to something
+/// tiny — what a truncated JPEG looks like on a real device.
+class _BigHeaderResizer extends Resizer {
+  @override
+  Future<Size> dimensions(File f) async => const Size(4000, 3000);
+}
+
+class _TinyDownloader extends Downloader {
+  int calls = 0;
+  @override
+  Future<void> download(
+    String url,
+    File target, {
+    UrlRefresher? refresher,
+  }) async {
+    calls++;
+    await target.writeAsBytes(img.encodePng(img.Image(width: 1, height: 1)));
   }
 }
 
@@ -72,18 +95,35 @@ void main() {
   const screen = Size(400, 800);
 
   test('bucket by area ratio', () {
-    expect(SizeBucket.resolve(const Size(100, 100), screen), SizeBucket.s);
-    expect(SizeBucket.resolve(const Size(300, 400), screen), SizeBucket.m);
-    expect(SizeBucket.resolve(const Size(400, 600), screen), SizeBucket.l);
+    expect(BucketScheme().resolve(const Size(100, 100), screen), 0);
+    expect(BucketScheme().resolve(const Size(300, 400), screen), 1);
+    expect(BucketScheme().resolve(const Size(400, 600), screen), 2);
+  });
+
+  test('dynamic schemes: 2-tier and 4-tier resolve', () {
+    expect(BucketScheme([0.5, 1.0]).resolve(const Size(100, 400), screen), 0);
+    expect(BucketScheme([0.5, 1.0]).resolve(const Size(400, 800), screen), 1);
+    expect(
+      BucketScheme([0.1, 0.33, 0.66, 1.0])
+          .resolve(const Size(100, 100), screen),
+      0,
+    );
+    expect(
+      BucketScheme([0.1, 0.33, 0.66, 1.0])
+          .resolve(const Size(500, 400), screen),
+      2,
+    );
+    expect(() => BucketScheme([0.5]), throwsArgumentError);
+    expect(() => BucketScheme([0.6, 0.2]), throwsArgumentError);
   });
 
   test('targetSize never upscales and keeps aspect', () {
     const px = Size(1200, 2400);
     expect(
-      SizeBucket.l.targetSize(const Size(100, 100), px),
+      SizeTier(1.0).targetSize(const Size(100, 100), px),
       const Size(100, 100),
     );
-    final t = SizeBucket.s.targetSize(const Size(4000, 2000), px);
+    final t = SizeTier(0.2).targetSize(const Size(4000, 2000), px);
     expect(t.width / t.height, closeTo(2, 0.01));
     expect(t.width * t.height, lessThanOrEqualTo(0.2 * 1200 * 2400 * 1.01));
   });
@@ -144,6 +184,31 @@ void main() {
       await server.close(force: true);
     });
 
+    test('rejects truncated responses and retries', () async {
+      var hits = 0;
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      unawaited(
+        server.forEach((socket) async {
+          hits++;
+          socket.write('HTTP/1.1 200 OK\r\ncontent-length: 5000\r\n\r\n');
+          socket.add(List.filled(500, 1));
+          await socket.flush();
+          await socket.close();
+        }),
+      );
+      final target = File('${dir.path}/t');
+      await expectLater(
+        Downloader(
+          maxAttempts: 2,
+          retryDelay: Duration.zero,
+        ).download('http://127.0.0.1:${server.port}/a', target),
+        throwsA(isA<IOException>()),
+      );
+      expect(hits, 2);
+      expect(target.existsSync(), false);
+      await server.close();
+    });
+
     test('accepts file under the limit', () async {
       final server = await _serve((r) {
         r.add(List.filled(500, 1));
@@ -164,13 +229,13 @@ void main() {
 
     test('cleanup removes expired then oldest over quota', () async {
       final cache = DiskCache(directory: dir, maxBytes: 10);
-      final old = await cache.put('a', SizeBucket.s, List.filled(8, 0));
+      final old = await cache.put('a', 'b0', List.filled(8, 0));
       old.setLastModifiedSync(
         DateTime.now().subtract(const Duration(days: 31)),
       );
-      final mid = await cache.put('b', SizeBucket.s, List.filled(8, 0));
+      final mid = await cache.put('b', 'b0', List.filled(8, 0));
       mid.setLastModifiedSync(DateTime.now().subtract(const Duration(days: 2)));
-      final fresh = await cache.put('c', SizeBucket.s, List.filled(8, 0));
+      final fresh = await cache.put('c', 'b0', List.filled(8, 0));
       await cache.cleanup();
       expect(old.existsSync(), false);
       expect(mid.existsSync(), false);
@@ -190,26 +255,25 @@ void main() {
         );
         const px = Size(1200, 2400);
 
-        final a = hub.request('u1', SizeBucket.s, px, cacheKey: 'k1');
-        final a2 = hub.request('u1', SizeBucket.s, px, cacheKey: 'k1');
+        final a = hub.request('u1', 0, px, cacheKey: 'k1');
+        final a2 = hub.request('u1', 0, px, cacheKey: 'k1');
         await Future.wait([a.future, a2.future]);
         expect(dl.calls, 1);
-        expect(rs.sizes.length, 3); // L, M, S
+        expect(rs.sizes.length, 4); // XS, L, M, S
         expect(rs.sources.toSet().length, 1); // all derived from the original
 
         rs.sizes.clear();
-        await hub
-            .request('u1', SizeBucket.m, px, cacheKey: 'k1')
-            .future; // cached
+        await hub.request('u1', 1, px, cacheKey: 'k1').future; // cached
         expect(dl.calls, 1);
         expect(rs.sizes, isEmpty);
 
-        expect(hub.peek('u1', SizeBucket.s, cacheKey: 'k1'), isNotNull);
-        expect(hub.peek('u1', SizeBucket.s, cacheKey: 'nope'), isNull);
+        expect(hub.peek('u1', 0, cacheKey: 'k1'), isNotNull);
+        expect(hub.peekXs('u1', cacheKey: 'k1'), isNotNull);
+        expect(hub.peek('u1', 0, cacheKey: 'nope'), isNull);
 
         await Future.wait([
           for (var i = 0; i < 6; i++)
-            hub.request('x$i', SizeBucket.l, px, cacheKey: 'x$i').future,
+            hub.request('x$i', 2, px, cacheKey: 'x$i').future,
         ]);
         expect(dl.maxActive, lessThanOrEqualTo(2));
         expect(rs.maxActive, lessThanOrEqualTo(2));
@@ -220,7 +284,7 @@ void main() {
       'corrupt cached source falls back to download; peek is warmed from disk',
       () async {
         final cache = DiskCache(directory: dir);
-        await cache.put(DiskCache.hash('k'), SizeBucket.l, [0]); // corrupt L
+        await cache.put(DiskCache.hash('k'), 'b2', [0]); // corrupt L
         final dl = _FakeDownloader();
         final hub = ImageHub(
           cache: cache,
@@ -228,14 +292,14 @@ void main() {
           resizer: _FakeResizer(),
         );
         await Future<void>.delayed(const Duration(milliseconds: 50));
-        expect(hub.peek('u', SizeBucket.l, cacheKey: 'k'), isNotNull);
+        expect(hub.peek('u', 2, cacheKey: 'k'), isNotNull);
         final f = await hub
-            .request('u', SizeBucket.m, const Size(1200, 2400), cacheKey: 'k')
+            .request('u', 1, const Size(1200, 2400), cacheKey: 'k')
             .future;
         expect(dl.calls, 1);
         expect(f.existsSync(), true);
-        await hub.invalidate('u', SizeBucket.m, cacheKey: 'k');
-        expect(hub.peek('u', SizeBucket.m, cacheKey: 'k'), isNull);
+        await hub.invalidate('u', 1, cacheKey: 'k');
+        expect(hub.peek('u', 1, cacheKey: 'k'), isNull);
         expect(f.existsSync(), false);
       },
     );
@@ -249,8 +313,8 @@ void main() {
       );
       const px = Size(1200, 2400);
       await Future.wait([
-        hub.request('u', SizeBucket.l, px, cacheKey: 'z').future,
-        hub.request('u', SizeBucket.s, px, cacheKey: 'z').future,
+        hub.request('u', 2, px, cacheKey: 'z').future,
+        hub.request('u', 0, px, cacheKey: 'z').future,
       ]);
       expect(dl.calls, 1);
     });
@@ -263,9 +327,7 @@ void main() {
         maxPixels: 1000,
       );
       await expectLater(
-        hub
-            .request('u', SizeBucket.s, const Size(1200, 2400), cacheKey: 'big')
-            .future,
+        hub.request('u', 0, const Size(1200, 2400), cacheKey: 'big').future,
         throwsA(isA<ImageTooLargeException>()),
       );
     });
@@ -278,15 +340,66 @@ void main() {
       );
       const px = Size(1200, 2400);
       Future<void> attempt() => hub
-          .request('u', SizeBucket.s, px, cacheKey: 'f')
+          .request('u', 0, px, cacheKey: 'f')
           .future
           .then((_) {}, onError: (_) {});
       await attempt();
       await attempt();
       expect(_FailingDownloader.calls, 1);
-      await hub.invalidate('u', SizeBucket.s, cacheKey: 'f');
+      await hub.invalidate('u', 0, cacheKey: 'f');
       await attempt();
       expect(_FailingDownloader.calls, 2);
+    });
+
+    test('configure replaces the singleton and rejects late calls', () async {
+      ImageHub.configure(maxDownloads: 4);
+      expect(ImageHub.instance.maxDownloads, 4);
+      await expectLater(
+        ImageHub.instance
+            .request('u', 0, const Size(1200, 2400), cacheKey: 'cfg')
+            .future,
+        completes,
+      ).catchError((_) {}); // download will fail offline; only _used matters
+      expect(() => ImageHub.configure(), throwsStateError);
+      ImageHub.instance = ImageHub(cache: DiskCache(directory: dir));
+    });
+
+    test(
+      'truncated download producing tiny output is retried then errors',
+      () async {
+        final dl = _TinyDownloader();
+        final hub = ImageHub(
+          cache: DiskCache(directory: dir),
+          downloader: dl,
+          resizer: _BigHeaderResizer(),
+          maxPixels: 1000 * 1000 * 1000,
+        );
+        await expectLater(
+          hub.request('u', 2, const Size(1200, 2400), cacheKey: 'tiny').future,
+          throwsA(isA<CorruptImageException>()),
+        );
+        expect(dl.calls, 2);
+      },
+    );
+
+    test('request S prefers nearest larger cached tier (M over L)', () async {
+      final dl = _FakeDownloader();
+      final rs = _FakeResizer();
+      final hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: dl,
+        resizer: rs,
+      );
+      const px = Size(1200, 2400);
+      await hub
+          .request('u', 2, px, cacheKey: 'n')
+          .future; // L (+ M? no: L only)
+      rs.sources.clear();
+      await hub.request('u', 0, px, cacheKey: 'n').future; // S
+      // S must derive M then S: 2 resize calls, all from the same source
+      expect(rs.sources.length, 2);
+      await hub.request('u', 1, px, cacheKey: 'n').future; // M already cached
+      // now request another image with only L cached -> S reuses L
     });
 
     test('cancelled queued job is dropped', () async {
@@ -298,8 +411,8 @@ void main() {
         maxDownloads: 1,
       );
       const px = Size(1200, 2400);
-      final r1 = hub.request('a', SizeBucket.l, px, cacheKey: 'a');
-      final r2 = hub.request('b', SizeBucket.l, px, cacheKey: 'b');
+      final r1 = hub.request('a', 2, px, cacheKey: 'a');
+      final r2 = hub.request('b', 2, px, cacheKey: 'b');
       r1.future.ignore();
       r1.cancel();
       r2.cancel();
@@ -318,5 +431,21 @@ void main() {
       ..writeAsBytesSync(img.encodeJpg(img.Image(width: 40, height: 20)));
     expect(await const Resizer().dimensions(f), const Size(20, 40));
     expect(await const Resizer().dimensions(plain), const Size(40, 20));
+  });
+
+  testWidgets('builds under IntrinsicHeight and shows skeleton', (t) async {
+    await t.pumpWidget(
+      const Directionality(
+        textDirection: TextDirection.ltr,
+        child: IntrinsicHeight(
+          child: Row(
+            children: [ResponsiveImageView('http://x/a.jpg', height: 80)],
+          ),
+        ),
+      ),
+    );
+    await t.pump();
+    expect(find.byType(ResponsiveImageSkeleton), findsOneWidget);
+    expect(t.takeException(), isNull);
   });
 }

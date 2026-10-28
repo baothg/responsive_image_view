@@ -16,10 +16,10 @@ class ImageRequest {
 }
 
 class _Job {
-  _Job(this.key, this.url, this.bucket, this.screenPx, this.refresher);
+  _Job(this.key, this.url, this.tier, this.screenPx, this.refresher);
   final String key;
   final String url;
-  final SizeBucket bucket;
+  final int tier;
   final Size screenPx;
   final UrlRefresher? refresher;
   final completer = Completer<File>()..future.ignore();
@@ -64,37 +64,76 @@ class ImageHub {
     Downloader? downloader,
     Resizer? resizer,
     this.maxDownloads = 6,
-    this.maxPixels = 100 * 1000 * 1000,
     int maxProcessing = 2,
+    this.maxPixels = 100 * 1000 * 1000,
+    BucketScheme? scheme,
   }) : cache = cache ?? DiskCache(),
        _downloader = downloader ?? Downloader(),
        _resizer = resizer ?? const Resizer(),
-       _cpu = _Gate(maxProcessing) {
+       _cpu = _Gate(maxProcessing),
+       scheme = scheme ?? BucketScheme() {
     unawaited(_warmUp());
   }
 
-  static final ImageHub instance = ImageHub();
+  /// The shared hub used by [ResponsiveImageView]. Defaults to sensible
+  /// limits; replace via [configure] *before the first image request*.
+  static ImageHub instance = ImageHub();
+
+  /// Replaces [instance] with custom limits. Throws if images were already
+  /// requested, since tuning mid-flight would split state between hubs.
+  static void configure({
+    int maxDownloads = 6,
+    int maxProcessing = 2,
+    int maxDownloadBytes = 30 * 1024 * 1024,
+    int maxPixels = 100 * 1000 * 1000,
+    int quality = 80,
+    Duration cacheMaxAge = const Duration(days: 30),
+    int cacheMaxBytes = 300 * 1024 * 1024,
+    List<double> bucketThresholds = const [0.2, 0.6, 1.0],
+  }) {
+    if (instance._used) {
+      throw StateError(
+        'ImageHub.configure() must run before any ResponsiveImageView is built',
+      );
+    }
+    instance = ImageHub(
+      cache: DiskCache(maxAge: cacheMaxAge, maxBytes: cacheMaxBytes),
+      downloader: Downloader(maxBytes: maxDownloadBytes),
+      resizer: Resizer(quality: quality),
+      maxDownloads: maxDownloads,
+      maxProcessing: maxProcessing,
+      maxPixels: maxPixels,
+      scheme: BucketScheme(bucketThresholds),
+    );
+  }
 
   static const _knownCapacity = 2000;
+
+  /// A failed image is not retried automatically for this long (scrolling
+  /// back to it would otherwise re-download and fail again). `invalidate`
+  /// (used by the widget's retry) clears it.
+  static const failureTtl = Duration(seconds: 60);
 
   final DiskCache cache;
   final Downloader _downloader;
   final Resizer _resizer;
   final int maxDownloads;
   final int maxPixels;
+  final BucketScheme scheme;
   final _Gate _cpu;
 
   final _jobs = <String, _Job>{};
   final _queue = <_Job>[];
   final _runningKeys = <String>{};
   int _running = 0;
+  bool _used = false;
   final _known = <String, File>{};
   final _failures = <String, (DateTime, Object)>{};
+  final _events = StreamController<(String, File)>.broadcast();
 
-  /// A failed image is not retried automatically for this long (scrolling
-  /// back to it would otherwise re-download and fail again). `invalidate`
-  /// (used by the widget's retry) clears it.
-  static const failureTtl = Duration(seconds: 60);
+  /// Emits (cache id, file) for every bucket produced, smallest first, so
+  /// widgets can show previews while the target bucket is still processing.
+  Stream<(String, File)> get events => _events.stream;
 
   /// Cleans the disk cache and indexes surviving files so [peek] works from
   /// the first frame of a new session.
@@ -113,50 +152,48 @@ class ImageHub {
     _known.remove(id);
     _known[id] = f;
     if (_known.length > _knownCapacity) _known.remove(_known.keys.first);
+    _events.add((id, f));
   }
 
-  String _id(String key, SizeBucket b) => '${key}_${b.name}';
-
-  static String _keyOf(String url, String? cacheKey) =>
+  static String keyOf(String url, String? cacheKey) =>
       cacheKey == null ? DiskCache.keyFor(url) : DiskCache.hash(cacheKey);
 
+  static String _id(String key, String variant) => '${key}_$variant';
+
   /// Synchronous lookup of an already produced file (avoids a placeholder
-  /// flash when a list item is rebuilt).
-  File? peek(String url, SizeBucket bucket, {String? cacheKey}) {
-    final id = _id(_keyOf(url, cacheKey), bucket);
-    // The hub owns every write/delete, so entries always point at files it
-    // created. If the OS evicts tmp files, Image.file reports an error and
-    // the widget invalidates the entry and reloads.
-    return _known[id];
-  }
+  /// flash when a list item is rebuilt). The index is authoritative: the hub
+  /// owns every write/delete, and decode errors self-heal via the widget.
+  File? peek(String url, int tier, {String? cacheKey}) =>
+      _known[_id(keyOf(url, cacheKey), 'b$tier')];
+
+  /// The cached XS preview file, if any.
+  File? peekXs(String url, {String? cacheKey}) =>
+      _known[_id(keyOf(url, cacheKey), 'xs')];
 
   /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
-  Future<void> invalidate(
-    String url,
-    SizeBucket bucket, {
-    String? cacheKey,
-  }) async {
-    await _invalidateKey(_keyOf(url, cacheKey), bucket);
+  Future<void> invalidate(String url, int tier, {String? cacheKey}) async {
+    await _invalidateVariant(keyOf(url, cacheKey), 'b$tier');
   }
 
-  Future<void> _invalidateKey(String key, SizeBucket bucket) async {
-    _known.remove(_id(key, bucket));
-    _failures.remove(_id(key, bucket));
+  Future<void> _invalidateVariant(String key, String variant) async {
+    final id = _id(key, variant);
+    _known.remove(id);
+    _failures.remove(id);
     await (await cache.fileFor(
       key,
-      bucket,
+      variant,
     )).delete().catchError((_) => File(''));
   }
 
   ImageRequest request(
     String url,
-    SizeBucket bucket,
+    int tier,
     Size screenPx, {
     String? cacheKey,
     UrlRefresher? refresher,
   }) {
-    final key = _keyOf(url, cacheKey);
-    final id = _id(key, bucket);
+    final key = keyOf(url, cacheKey);
+    final id = _id(key, 'b$tier');
     final failed = _failures[id];
     if (failed != null) {
       if (DateTime.now().difference(failed.$1) < failureTtl) {
@@ -164,8 +201,9 @@ class ImageHub {
       }
       _failures.remove(id);
     }
+    _used = true;
     final job = _jobs.putIfAbsent(id, () {
-      final j = _Job(key, url, bucket, screenPx, refresher);
+      final j = _Job(key, url, tier, screenPx, refresher);
       _queue.add(j);
       scheduleMicrotask(_pump);
       return j;
@@ -200,12 +238,12 @@ class ImageHub {
               if (_failures.length > 200) {
                 _failures.remove(_failures.keys.first);
               }
-              _failures[_id(job.key, job.bucket)] = (DateTime.now(), e);
+              _failures[_id(job.key, 'b${job.tier}')] = (DateTime.now(), e);
               job.completer.completeError(e, st);
             },
           )
           .whenComplete(() {
-            _jobs.remove(_id(job.key, job.bucket));
+            _jobs.remove(_id(job.key, 'b${job.tier}'));
             _running--;
             _runningKeys.remove(job.key);
             _pump();
@@ -214,67 +252,89 @@ class ImageHub {
   }
 
   Future<File> _run(_Job job) async {
-    final hit = await cache.get(job.key, job.bucket);
+    final variant = 'b${job.tier}';
+    final hit = await cache.get(job.key, variant);
     if (hit != null) {
-      _remember(_id(job.key, job.bucket), hit);
+      _remember(_id(job.key, variant), hit);
       return hit;
     }
 
-    // Lazy: reuse the nearest larger cached bucket as source, else download.
-    for (final b in job.bucket.sameOrLarger.skip(1)) {
-      final f = await cache.get(job.key, b);
+    // Lazy: reuse the *nearest* larger cached tier as source, else download.
+    for (var i = job.tier + 1; i < scheme.count; i++) {
+      final v = 'b$i';
+      final f = await cache.get(job.key, v);
       if (f == null) continue;
       try {
         return await _process(job, f, [
-          for (final x in SizeBucket.values.reversed)
-            if (x.index >= job.bucket.index && x.index < b.index) x,
+          for (var x = i - 1; x >= job.tier; x--) 'b$x',
         ]);
       } catch (_) {
-        await invalidate(
-          job.url,
-          b,
-          cacheKey: job.key,
+        await _invalidateVariant(
+          job.key,
+          v,
         ); // corrupt source: fall back to a fresh download
       }
       break;
     }
 
-    final temp = await cache.tempFile(
-      '${job.key}_${DateTime.now().microsecondsSinceEpoch}',
-    );
-    try {
-      await _downloader.download(job.url, temp, refresher: job.refresher);
-      return await _process(job, temp, [
-        for (final x in SizeBucket.values.reversed)
-          if (x.index >= job.bucket.index) x,
-      ]);
-    } finally {
-      await temp.delete().catchError((_) => temp);
+    // Retry once when the download decoded as corrupt (e.g. a truncated
+    // transfer that closed cleanly).
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final temp = await cache.tempFile(
+        '${job.key}_${DateTime.now().microsecondsSinceEpoch}',
+      );
+      try {
+        await _downloader.download(job.url, temp, refresher: job.refresher);
+        return await _process(job, temp, [
+          for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
+        ]);
+      } on CorruptImageException {
+        if (attempt == 1) rethrow;
+      } finally {
+        await temp.delete().catchError((_) => temp);
+      }
     }
+    throw StateError('unreachable');
   }
 
-  /// Produces every bucket in [steps] (largest first) directly from [source],
-  /// so quality never degrades through repeated lossy re-encoding.
-  Future<File> _process(_Job job, File source, List<SizeBucket> steps) async {
+  /// Produces every variant in [steps] (largest first) directly from [source],
+  /// so quality never degrades through repeated lossy re-encoding. The XS
+  /// preview is encoded first so it reaches listeners as early as possible.
+  Future<File> _process(_Job job, File source, List<String> steps) async {
     final srcSize = await _resizer.dimensions(source);
     if (srcSize.width * srcSize.height > maxPixels) {
       throw ImageTooLargeException(
         '${srcSize.width.round()}x${srcSize.height.round()} exceeds $maxPixels pixels',
       );
     }
+    if (await cache.get(job.key, 'xs') == null) {
+      final f = await cache.put(
+        job.key,
+        'xs',
+        await _cpu.run(
+          () => _resizer.resize(
+            source,
+            srcSize,
+            xsTier.targetSize(srcSize, job.screenPx),
+          ),
+        ),
+      );
+      _remember(_id(job.key, 'xs'), f);
+    }
     File? result;
     Size? lastTarget;
     List<int>? lastBytes;
-    for (final b in steps) {
-      final target = b.targetSize(srcSize, job.screenPx);
+    for (final v in steps) {
+      final tier = int.parse(v.substring(1));
+      final target = scheme[tier].targetSize(srcSize, job.screenPx);
       if (target != lastTarget) {
         lastBytes = await _cpu.run(
           () => _resizer.resize(source, srcSize, target),
         );
         lastTarget = target;
       }
-      result = await cache.put(job.key, b, lastBytes!);
-      _remember(_id(job.key, b), result);
+      result = await cache.put(job.key, v, lastBytes!);
+      _remember(_id(job.key, v), result);
     }
     return result!;
   }

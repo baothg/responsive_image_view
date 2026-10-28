@@ -8,6 +8,7 @@ ResponsiveImageView(
   width: 100,
   height: 100,
   fit: BoxFit.cover,
+  // Shows a shimmer skeleton while loading; override with `placeholder`.
   errorBuilder: (context, error, retry) => IconButton(icon: Icon(Icons.refresh), onPressed: retry),
   urlRefresher: (expired) async => await api.refreshUrl(expired), // optional
 );
@@ -20,6 +21,20 @@ ResponsiveImageView(
 - A hub admits up to 6 images at a time (newest request first, identical requests deduplicated, queued ones dropped when widgets are disposed) but runs at most 2 resize/encode steps concurrently. Files already on disk are indexed at startup so rebuilt list items show instantly without a placeholder flash.
 
 Limits: downloads over 30MB and images over 100 megapixels are rejected (`ImageTooLargeException`, never retried) before any heavy work. A failed image is not re-downloaded automatically for 60s; the `retry` callback in `errorBuilder` forces a reload.
+
+```dart
+// Optional, call once before the first image (e.g. in main()):
+ResponsiveImageView.configure(
+  maxDownloads: 6,        // concurrent download+process jobs
+  maxProcessing: 2,       // concurrent resize/encode steps
+  maxDownloadBytes: 30 * 1024 * 1024,
+  maxPixels: 100 * 1000 * 1000,
+  quality: 80,            // WebP quality
+  cacheMaxAge: Duration(days: 30),
+  cacheMaxBytes: 300 * 1024 * 1024,
+  bucketThresholds: [0.2, 0.6, 1.0], // 2-4 ascending ratios; XS preview fixed at 5%
+);
+```
 
 Only static raster images are supported. Animated images (GIF, animated WebP) are reduced to their first frame; SVG is not supported and reports an error.
 
