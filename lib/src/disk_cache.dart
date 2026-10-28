@@ -38,6 +38,8 @@ class DiskCache {
     'e',
   };
 
+  static String hash(String s) => sha1.convert(utf8.encode(s)).toString();
+
   static String keyFor(String url) {
     final uri = Uri.tryParse(url);
     var normalized = url;
@@ -51,7 +53,7 @@ class DiskCache {
         });
       normalized = uri.replace(queryParameters: kept).toString();
     }
-    return sha1.convert(utf8.encode(normalized)).toString();
+    return hash(normalized);
   }
 
   Future<Directory> get directory => _init ??= () async {

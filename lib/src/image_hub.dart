@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:io';
 import 'dart:ui';
 
@@ -84,7 +83,8 @@ class ImageHub {
   final _Gate _cpu;
 
   final _jobs = <String, _Job>{};
-  final _queue = ListQueue<_Job>();
+  final _queue = <_Job>[];
+  final _runningKeys = <String>{};
   int _running = 0;
   final _known = <String, File>{};
 
@@ -109,10 +109,13 @@ class ImageHub {
 
   String _id(String key, SizeBucket b) => '${key}_${b.name}';
 
+  static String _keyOf(String url, String? cacheKey) =>
+      cacheKey == null ? DiskCache.keyFor(url) : DiskCache.hash(cacheKey);
+
   /// Synchronous lookup of an already produced file (avoids a placeholder
   /// flash when a list item is rebuilt).
   File? peek(String url, SizeBucket bucket, {String? cacheKey}) {
-    final id = _id(cacheKey ?? DiskCache.keyFor(url), bucket);
+    final id = _id(_keyOf(url, cacheKey), bucket);
     final f = _known[id];
     if (f == null) return null;
     if (!f.existsSync()) {
@@ -128,7 +131,10 @@ class ImageHub {
     SizeBucket bucket, {
     String? cacheKey,
   }) async {
-    final key = cacheKey ?? DiskCache.keyFor(url);
+    await _invalidateKey(_keyOf(url, cacheKey), bucket);
+  }
+
+  Future<void> _invalidateKey(String key, SizeBucket bucket) async {
     _known.remove(_id(key, bucket));
     await (await cache.fileFor(
       key,
@@ -143,11 +149,11 @@ class ImageHub {
     String? cacheKey,
     UrlRefresher? refresher,
   }) {
-    final key = cacheKey ?? DiskCache.keyFor(url);
+    final key = _keyOf(url, cacheKey);
     final id = _id(key, bucket);
     final job = _jobs.putIfAbsent(id, () {
       final j = _Job(key, url, bucket, screenPx, refresher);
-      _queue.addLast(j);
+      _queue.add(j);
       scheduleMicrotask(_pump);
       return j;
     });
@@ -165,15 +171,21 @@ class ImageHub {
   }
 
   void _pump() {
-    while (_running < maxDownloads && _queue.isNotEmpty) {
-      final job = _queue.removeLast();
+    while (_running < maxDownloads) {
+      // Newest first, but never run two jobs for the same image at once: the
+      // later one reuses the files the first one writes instead of downloading again.
+      final i = _queue.lastIndexWhere((j) => !_runningKeys.contains(j.key));
+      if (i < 0) return;
+      final job = _queue.removeAt(i);
       job.started = true;
       _running++;
+      _runningKeys.add(job.key);
       _run(job)
           .then(job.completer.complete, onError: job.completer.completeError)
           .whenComplete(() {
             _jobs.remove(_id(job.key, job.bucket));
             _running--;
+            _runningKeys.remove(job.key);
             _pump();
           });
     }

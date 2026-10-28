@@ -127,7 +127,6 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
         if (_file != null) {
           child = Image.file(
             _file!,
-            key: ValueKey(_file!.path),
             width: widget.width,
             height: widget.height,
             fit: widget.fit,

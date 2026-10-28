@@ -143,7 +143,7 @@ void main() {
       'corrupt cached source falls back to download; peek is warmed from disk',
       () async {
         final cache = DiskCache(directory: dir);
-        await cache.put('k', SizeBucket.l, [0]); // corrupt L
+        await cache.put(DiskCache.hash('k'), SizeBucket.l, [0]); // corrupt L
         final dl = _FakeDownloader();
         final hub = ImageHub(
           cache: cache,
@@ -162,6 +162,21 @@ void main() {
         expect(f.existsSync(), false);
       },
     );
+
+    test('same image requested in two buckets downloads once', () async {
+      final dl = _FakeDownloader();
+      final hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      const px = Size(1200, 2400);
+      await Future.wait([
+        hub.request('u', SizeBucket.l, px, cacheKey: 'z').future,
+        hub.request('u', SizeBucket.s, px, cacheKey: 'z').future,
+      ]);
+      expect(dl.calls, 1);
+    });
 
     test('cancelled queued job is dropped', () async {
       final dl = _FakeDownloader();
