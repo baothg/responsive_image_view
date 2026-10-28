@@ -10,13 +10,15 @@ class Demo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    Widget img(int i, double w, double h, int sw, int sh) => ResponsiveImageView(
+    Widget img(int i, double w, double h, int sw, int sh) =>
+        ResponsiveImageView(
           _url(i, sw, sh),
           width: w,
           height: h,
           fit: BoxFit.cover,
           placeholder: (_) => const ColoredBox(color: Colors.black12),
-          errorBuilder: (_, e) => const Icon(Icons.broken_image),
+          errorBuilder: (_, e, retry) =>
+              IconButton(icon: const Icon(Icons.refresh), onPressed: retry),
         );
     return Scaffold(
       appBar: AppBar(title: const Text('ResponsiveImageView')),
@@ -24,10 +26,14 @@ class Demo extends StatelessWidget {
         children: [
           img(1, double.infinity, 360, 4000, 3000),
           const Padding(padding: EdgeInsets.all(8), child: Text('L / M / S')),
-          Wrap(spacing: 4, runSpacing: 4, children: [
-            img(2, 200, 200, 3000, 3000),
-            for (var i = 10; i < 40; i++) img(i, 80, 80, 3000, 3000),
-          ]),
+          Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: [
+              img(2, 200, 200, 3000, 3000),
+              for (var i = 10; i < 40; i++) img(i, 80, 80, 3000, 3000),
+            ],
+          ),
         ],
       ),
     );

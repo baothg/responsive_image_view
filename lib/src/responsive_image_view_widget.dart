@@ -27,7 +27,10 @@ class ResponsiveImageView extends StatefulWidget {
   final BoxFit? fit;
   final AlignmentGeometry alignment;
   final WidgetBuilder? placeholder;
-  final Widget Function(BuildContext context, Object error)? errorBuilder;
+
+  /// Builds the error state. Call [retry] (e.g. from a button) to reload the image.
+  final Widget Function(BuildContext context, Object error, VoidCallback retry)?
+  errorBuilder;
 
   /// Called when the url looks expired (401/403/404/410) to obtain a fresh one.
   final Future<String?> Function(String expiredUrl)? urlRefresher;
@@ -93,6 +96,24 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     );
   }
 
+  Future<void> _retry() async {
+    if (!mounted || _bucket == null) return;
+    if (_file != null) {
+      await ImageHub.instance.invalidate(
+        widget.url,
+        _bucket!,
+        cacheKey: widget.cacheKey,
+      );
+      if (!mounted) return;
+    }
+    setState(() {
+      _file = null;
+      _error = null;
+      _retriedFor = null;
+      _loadedFor = null;
+    });
+  }
+
   void _onFileError() {
     if (_retriedFor == _loadedFor) return;
     _retriedFor = _loadedFor;
@@ -135,12 +156,12 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
             gaplessPlayback: true,
             errorBuilder: (ctx, e, _) {
               _onFileError();
-              return widget.errorBuilder?.call(ctx, e) ??
+              return widget.errorBuilder?.call(ctx, e, _retry) ??
                   const SizedBox.shrink();
             },
           );
         } else if (_error != null && widget.errorBuilder != null) {
-          child = widget.errorBuilder!(context, _error!);
+          child = widget.errorBuilder!(context, _error!, _retry);
         } else {
           child = widget.placeholder?.call(context) ?? const SizedBox.shrink();
         }

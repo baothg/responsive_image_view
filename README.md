@@ -8,6 +8,7 @@ ResponsiveImageView(
   width: 100,
   height: 100,
   fit: BoxFit.cover,
+  errorBuilder: (context, error, retry) => IconButton(icon: Icon(Icons.refresh), onPressed: retry),
   urlRefresher: (expired) async => await api.refreshUrl(expired), // optional
 );
 ```
