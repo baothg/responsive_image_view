@@ -93,6 +93,9 @@ void main() {
       expect(dl.calls, 1);
       expect(rs.sizes, isEmpty);
 
+      expect(hub.peek('u1', SizeBucket.s, cacheKey: 'k1'), isNotNull);
+      expect(hub.peek('u1', SizeBucket.s, cacheKey: 'nope'), isNull);
+
       await Future.wait([for (var i = 0; i < 6; i++) hub.request('x$i', SizeBucket.l, px, cacheKey: 'x$i').future]);
       expect(dl.maxActive, lessThanOrEqualTo(2));
     });

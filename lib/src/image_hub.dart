@@ -23,7 +23,7 @@ class _Job {
   final SizeBucket bucket;
   final Size screenPx;
   final UrlRefresher? refresher;
-  final completer = Completer<File>();
+  final completer = Completer<File>()..future.ignore();
   int listeners = 0;
   bool started = false;
 }
@@ -53,6 +53,26 @@ class ImageHub {
   final _jobs = <String, _Job>{};
   final _queue = ListQueue<_Job>();
   int _running = 0;
+  final _known = <String, File>{};
+
+  void _remember(String id, File f) {
+    _known.remove(id);
+    _known[id] = f;
+    if (_known.length > 500) _known.remove(_known.keys.first);
+  }
+
+  /// Synchronous lookup of a file already produced in this session (avoids a
+  /// placeholder flash when a list item is rebuilt).
+  File? peek(String url, SizeBucket bucket, {String? cacheKey}) {
+    final id = '${cacheKey ?? DiskCache.keyFor(url)}_${bucket.name}';
+    final f = _known[id];
+    if (f == null) return null;
+    if (!f.existsSync()) {
+      _known.remove(id);
+      return null;
+    }
+    return f;
+  }
 
   ImageRequest request(String url, SizeBucket bucket, Size screenPx, {String? cacheKey, UrlRefresher? refresher}) {
     final key = cacheKey ?? DiskCache.keyFor(url);
@@ -71,7 +91,6 @@ class ImageHub {
       if (--job.listeners == 0 && !job.started) {
         _queue.remove(job);
         _jobs.remove(id);
-        job.completer.future.ignore();
         job.completer.completeError(const _Cancelled());
       }
     });
@@ -92,7 +111,10 @@ class ImageHub {
 
   Future<File> _run(_Job job) async {
     final hit = await cache.get(job.key, job.bucket);
-    if (hit != null) return hit;
+    if (hit != null) {
+      _remember('${job.key}_${job.bucket.name}', hit);
+      return hit;
+    }
 
     // Lazy: reuse the nearest larger cached bucket as source, else download.
     File? source;
@@ -125,6 +147,7 @@ class ImageHub {
             ? await source!.readAsBytes()
             : await _resizer.resize(source!, srcSize, target);
         result = await cache.put(job.key, b, bytes);
+        _remember('${job.key}_${b.name}', result);
         source = result;
         srcSize = target;
       }

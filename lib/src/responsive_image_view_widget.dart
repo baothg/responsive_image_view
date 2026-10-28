@@ -41,7 +41,7 @@ class ResponsiveImageView extends StatefulWidget {
 
 class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   ImageRequest? _request;
-  SizeBucket? _bucket;
+  String? _sourceId;
   String? _loadedFor;
   File? _file;
   Object? _error;
@@ -53,14 +53,20 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   }
 
   void _ensureLoaded(SizeBucket bucket, Size screenPx) {
-    final id = '${widget.cacheKey ?? widget.url}|${bucket.name}';
+    final source = widget.cacheKey ?? widget.url;
+    final id = '$source|${bucket.name}';
     if (_loadedFor == id) return;
     _loadedFor = id;
     _request?.cancel();
-    final keepOld = _bucket != null && widget.cacheKey == null;
-    _bucket = bucket;
-    if (!keepOld) _file = null;
+    _request = null;
+    if (_sourceId != source) _file = null;
+    _sourceId = source;
     _error = null;
+    final cached = ImageHub.instance.peek(widget.url, bucket, cacheKey: widget.cacheKey);
+    if (cached != null) {
+      _file = cached;
+      return;
+    }
     final req = _request = ImageHub.instance.request(widget.url, bucket, screenPx,
         cacheKey: widget.cacheKey, refresher: widget.urlRefresher);
     req.future.then((f) {
@@ -72,13 +78,13 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
 
   @override
   Widget build(BuildContext context) {
-    final mq = MediaQuery.of(context);
-    final screen = mq.size;
+    final screen = MediaQuery.sizeOf(context);
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     return LayoutBuilder(builder: (context, c) {
       final w = widget.width ?? (c.hasBoundedWidth ? c.maxWidth : screen.width);
       final h = widget.height ?? (c.hasBoundedHeight ? c.maxHeight : screen.height);
       final bucket = SizeBucket.resolve(Size(w, h), screen);
-      _ensureLoaded(bucket, screen * mq.devicePixelRatio);
+      _ensureLoaded(bucket, screen * dpr);
       Widget child;
       if (_file != null) {
         child = Image.file(_file!,
@@ -87,7 +93,7 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
             height: widget.height,
             fit: widget.fit,
             alignment: widget.alignment,
-            cacheWidth: (w * mq.devicePixelRatio).round(),
+            cacheWidth: (w * dpr).round(),
             gaplessPlayback: true,
             errorBuilder: widget.errorBuilder == null ? null : (ctx, e, _) => widget.errorBuilder!(ctx, e));
       } else if (_error != null && widget.errorBuilder != null) {

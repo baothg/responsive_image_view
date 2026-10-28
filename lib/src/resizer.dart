@@ -30,6 +30,8 @@ class Resizer {
   /// Produces bytes of [src] scaled to [target] (equal to source size = no
   /// resize, only recompress). Returned bytes may be the original if smaller.
   Future<Uint8List> resize(File src, ui.Size source, ui.Size target) async {
+    final head = await _head(src);
+    if (head.length > 3 && head[0] == 0x47 && head[1] == 0x49 && head[2] == 0x46) return src.readAsBytes(); // GIF: keep animation
     final w = target.width.round(), h = target.height.round();
     Uint8List? bytes;
     try {
@@ -49,6 +51,15 @@ class Resizer {
     final noResize = target == source;
     if (noResize && out.length >= await src.length()) return src.readAsBytes();
     return out;
+  }
+}
+
+Future<List<int>> _head(File f) async {
+  final raf = await f.open();
+  try {
+    return await raf.read(4);
+  } finally {
+    await raf.close();
   }
 }
 
