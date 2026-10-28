@@ -20,54 +20,39 @@ const urls = [
 class Demo extends StatelessWidget {
   const Demo({super.key});
 
-  static Widget img(String url, {double? w, double? h}) => ResponsiveImageView(
-    url,
-    width: w,
-    height: h,
-    fit: BoxFit.cover,
-    placeholder: (_) => const ColoredBox(color: Colors.black12),
-    errorBuilder: (_, e, retry) =>
-        IconButton(icon: const Icon(Icons.refresh), onPressed: retry),
-  );
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ResponsiveImageView')),
-      body: ListView(
-        children: [
-          img(urls[0], h: 420), // L
-          Row(
-            children: [
-              Expanded(child: img(urls[1], h: 200)), // M
-              Expanded(child: img(urls[2], h: 200)), // M
-            ],
-          ),
-          GridView.count(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            crossAxisCount: 4,
-            mainAxisSpacing: 4,
-            crossAxisSpacing: 4,
-            children: [
-              for (var i = 3; i < urls.length; i++) img(urls[i], w: 90, h: 90),
-            ], // S
-          ),
-          const Divider(),
-          for (var i = 0; i < urls.length; i++) // list: M per row
-            ListTile(
-              leading: SizedBox(
-                width: 72,
-                height: 72,
-                child: img(urls[i], w: 72, h: 72),
-              ),
-              title: Text('Photo ${i + 1}'),
-              subtitle: Text(
-                urls[i].split('/').last,
-                style: const TextStyle(fontSize: 10),
-              ),
+      appBar: AppBar(title: const Text('ResponsiveImageView — 100 rows')),
+      body: ListView.builder(
+        itemCount: 100,
+        itemBuilder: (context, index) {
+          final count = index % 3 + 2; // 2, 3 or 4 images per row
+          return Padding(
+            padding: const EdgeInsets.all(2),
+            child: Row(
+              children: [
+                for (var j = 0; j < count; j++)
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.all(2),
+                      child: AspectRatio(
+                        aspectRatio: 3 / 2, // height = width * 2/3
+                        child: ResponsiveImageView(
+                          urls[(index + j) % urls.length],
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, retry) => IconButton(
+                            icon: const Icon(Icons.refresh),
+                            onPressed: retry,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
-        ],
+          );
+        },
       ),
     );
   }

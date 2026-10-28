@@ -1,16 +1,19 @@
 import 'package:flutter/widgets.dart';
 
-/// Default loading view: a base block that pulses while a bright band
-/// sweeps across, so it reads as "loading" rather than an empty box.
+/// Default loading view: a `shimmer`-style gradient sweep
+/// (base -> highlight -> base sliding diagonally), so it reads as "loading"
+/// rather than an empty box.
 class ResponsiveImageSkeleton extends StatefulWidget {
   const ResponsiveImageSkeleton({
     super.key,
-    this.baseColor = const Color(0xFFCDCDCD),
-    this.highlightColor = const Color(0xFFFFFFFF),
+    this.baseColor = const Color(0xFFBDBDBD),
+    this.highlightColor = const Color(0xFFFAFAFA),
+    this.period = const Duration(milliseconds: 1500),
   });
 
   final Color baseColor;
   final Color highlightColor;
+  final Duration period;
 
   @override
   State<ResponsiveImageSkeleton> createState() =>
@@ -19,10 +22,8 @@ class ResponsiveImageSkeleton extends StatefulWidget {
 
 class _ResponsiveImageSkeletonState extends State<ResponsiveImageSkeleton>
     with SingleTickerProviderStateMixin {
-  late final _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1200),
-  )..repeat();
+  late final _c = AnimationController(vsync: this, duration: widget.period)
+    ..repeat();
 
   @override
   void dispose() {
@@ -49,28 +50,24 @@ class _SkeletonPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final pulse =
-        0.55 + 0.35 * (t.value < 0.5 ? t.value * 2 : (1 - t.value) * 2);
     final rect = Offset.zero & size;
+    // Same as the `shimmer` package: a slightly diagonal base->highlight->base
+    // gradient slid horizontally; edges clamp to base color so only the
+    // highlight peak sweeps visibly.
+    final dx = size.width * (2 * t.value - 1);
     canvas.drawRect(
       rect,
-      Paint()..color = base.withAlpha((base.a * pulse).round()),
-    );
-    final bandW = size.width * 0.6;
-    final x = -bandW + (size.width + bandW) * t.value;
-    canvas.drawRect(
-      Rect.fromLTWH(x, 0, bandW, size.height),
       Paint()
         ..shader = LinearGradient(
-          colors: [
-            highlight.withAlpha(0),
-            highlight.withAlpha(140),
-            highlight.withAlpha(0),
-          ],
-        ).createShader(Rect.fromLTWH(x, 0, bandW, size.height)),
+          begin: const Alignment(-1.0, -0.3),
+          end: const Alignment(1.0, 0.3),
+          colors: [base, highlight, base],
+          stops: const [0.35, 0.5, 0.65],
+        ).createShader(Rect.fromLTWH(dx, 0, size.width, size.height)),
     );
   }
 
   @override
-  bool shouldRepaint(_SkeletonPainter old) => true;
+  bool shouldRepaint(_SkeletonPainter old) =>
+      old.t != t || old.base != base || old.highlight != highlight;
 }

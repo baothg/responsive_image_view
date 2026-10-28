@@ -209,6 +209,37 @@ void main() {
       await server.close();
     });
 
+    test('a slow-drip stream hits the overall download deadline', () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      var running = true;
+      unawaited(
+        server
+            .forEach((socket) async {
+              socket.write('HTTP/1.1 200 OK\r\ncontent-length: 999999\r\n\r\n');
+              await socket.flush();
+              while (running) {
+                socket.add([1]);
+                await socket.flush();
+                await Future<void>.delayed(const Duration(milliseconds: 200));
+              }
+              await socket.close();
+            })
+            .catchError((_) {}),
+      );
+      final target = File('${dir.path}/t');
+      final sw = Stopwatch()..start();
+      await expectLater(
+        Downloader(
+          maxAttempts: 1,
+          perDownloadTimeout: const Duration(milliseconds: 500),
+        ).download('http://127.0.0.1:${server.port}/a', target),
+        throwsA(isA<TimeoutException>()),
+      );
+      expect(sw.elapsed.inSeconds, lessThan(10));
+      running = false;
+      await server.close();
+    });
+
     test('accepts file under the limit', () async {
       final server = await _serve((r) {
         r.add(List.filled(500, 1));
@@ -448,4 +479,49 @@ void main() {
     expect(find.byType(ResponsiveImageSkeleton), findsOneWidget);
     expect(t.takeException(), isNull);
   });
+
+  for (final fixedSize in [true, false]) {
+    testWidgets(
+      'already-cached image replaces skeleton (${fixedSize ? 'fixed' : 'measured'} size)',
+      (t) async {
+        final dir = Directory.systemTemp.createTempSync('ri_w');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final cache = DiskCache(directory: dir);
+        final key = DiskCache.hash('cached-key');
+        final png = img.encodePng(img.Image(width: 8, height: 8));
+        await t.runAsync(() async {
+          await cache.put(key, 'b0', png);
+          await cache.put(key, 'xs', png);
+        });
+        late ImageHub hub;
+        await t.runAsync(() async {
+          hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        });
+        ImageHub.instance = hub;
+        await t.pumpWidget(
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                width: 72,
+                height: 72,
+                child: ResponsiveImageView(
+                  'http://x/a.jpg',
+                  cacheKey: 'cached-key',
+                  width: fixedSize ? 72 : null,
+                  height: fixedSize ? 72 : null,
+                ),
+              ),
+            ),
+          ),
+        );
+        await t.pump();
+        await t.pump();
+        expect(find.byType(ResponsiveImageSkeleton), findsNothing);
+        expect(find.byType(Image), findsOneWidget);
+      },
+    );
+  }
 }

@@ -41,6 +41,8 @@ class ResponsiveImageView extends StatefulWidget {
 
   /// Tunes download/resize concurrency, size limits, quality and disk cache.
   /// Must be called before the first [ResponsiveImageView] is built.
+  /// [skeletonBaseColor]/[skeletonHighlightColor] style the default skeleton
+  /// (per-widget override via [placeholder]).
   /// [bucketThresholds] sets the display tiers: 2-4 ascending ratios of
   /// screen area; the last is the "everything larger" tier (usually 1.0).
   /// The XS preview tier is fixed at 5% and is always produced first.
@@ -53,6 +55,8 @@ class ResponsiveImageView extends StatefulWidget {
     Duration cacheMaxAge = const Duration(days: 30),
     int cacheMaxBytes = 300 * 1024 * 1024,
     List<double> bucketThresholds = const [0.2, 0.6, 1.0],
+    Color skeletonBaseColor = const Color(0xFFBDBDBD),
+    Color skeletonHighlightColor = const Color(0xFFFAFAFA),
   }) => ImageHub.configure(
     maxDownloads: maxDownloads,
     maxProcessing: maxProcessing,
@@ -62,6 +66,8 @@ class ResponsiveImageView extends StatefulWidget {
     cacheMaxAge: cacheMaxAge,
     cacheMaxBytes: cacheMaxBytes,
     bucketThresholds: bucketThresholds,
+    skeletonBaseColor: skeletonBaseColor,
+    skeletonHighlightColor: skeletonHighlightColor,
   );
 
   @override
@@ -173,15 +179,27 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final screen = MediaQuery.sizeOf(context);
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final w = widget.width, h = widget.height;
+    final screenPx = screen * dpr;
+    // Known size: resolve right here in build (no extra frame, and a cached
+    // image shows immediately). Unknown size: measure after layout.
+    if (w != null && h != null) {
+      _ensureLoaded(
+        ImageHub.instance.scheme.resolve(Size(w, h), screen),
+        screenPx,
+      );
+    }
     return _MeasuredSize(
+      enabled: w == null || h == null,
       onSize: (size) {
-        // Measure after layout instead of LayoutBuilder so the widget also
-        // works under Intrinsic*/unbounded parents.
+        if (!mounted) return;
         final realW = w ?? (size.width > 0 ? size.width : screen.width);
         final realH = h ?? (size.height > 0 ? size.height : screen.height);
-        _ensureLoaded(
-          ImageHub.instance.scheme.resolve(Size(realW, realH), screen),
-          screen * dpr,
+        // Runs outside build, so state changes must trigger a rebuild.
+        setState(
+          () => _ensureLoaded(
+            ImageHub.instance.scheme.resolve(Size(realW, realH), screen),
+            screenPx,
+          ),
         );
       },
       child: SizedBox(
@@ -215,10 +233,24 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               fit: widget.fit,
               alignment: widget.alignment,
               gaplessPlayback: true,
+              errorBuilder: (_, _, _) {
+                // Broken/deleted preview: drop it and fall back to skeleton.
+                unawaited(
+                  ImageHub.instance.invalidateXs(
+                    widget.url,
+                    cacheKey: widget.cacheKey,
+                  ),
+                );
+                if (mounted) setState(() => _preview = null);
+                return const SizedBox.shrink();
+              },
             );
           }
           return widget.placeholder?.call(context) ??
-              const ResponsiveImageSkeleton();
+              ResponsiveImageSkeleton(
+                baseColor: ImageHub.instance.skeletonBaseColor,
+                highlightColor: ImageHub.instance.skeletonHighlightColor,
+              );
         }(),
       ),
     );
@@ -226,7 +258,12 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
 }
 
 class _MeasuredSize extends StatefulWidget {
-  const _MeasuredSize({required this.onSize, required this.child});
+  const _MeasuredSize({
+    required this.enabled,
+    required this.onSize,
+    required this.child,
+  });
+  final bool enabled;
   final ValueChanged<Size> onSize;
   final Widget child;
 
@@ -239,6 +276,7 @@ class _MeasuredSizeState extends State<_MeasuredSize> {
 
   @override
   Widget build(BuildContext context) {
+    if (!widget.enabled) return widget.child;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final box = context.findRenderObject();

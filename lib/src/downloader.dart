@@ -26,6 +26,7 @@ class Downloader {
     HttpClient? client,
     this.maxAttempts = 3,
     this.maxBytes = 30 * 1024 * 1024,
+    this.perDownloadTimeout = const Duration(seconds: 60),
     this.retryDelay = const Duration(milliseconds: 500),
   }) : _client = (client ?? HttpClient())
          ..connectionTimeout = const Duration(seconds: 15);
@@ -33,6 +34,10 @@ class Downloader {
   final HttpClient _client;
   final int maxAttempts;
   final int maxBytes;
+
+  /// Hard deadline per download attempt — a stalled/slow-drip connection can
+  /// otherwise hold a hub slot forever and starve every queued image.
+  final Duration perDownloadTimeout;
   final Duration retryDelay;
 
   static bool _expired(int s) => s == 401 || s == 403 || s == 404 || s == 410;
@@ -46,7 +51,7 @@ class Downloader {
     var current = url;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        await _fetch(current, target);
+        await _fetch(current, target).timeout(perDownloadTimeout);
         return;
       } on DownloadException catch (e) {
         last = e;

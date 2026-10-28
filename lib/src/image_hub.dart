@@ -66,6 +66,8 @@ class ImageHub {
     this.maxDownloads = 6,
     int maxProcessing = 2,
     this.maxPixels = 100 * 1000 * 1000,
+    this.skeletonBaseColor = const Color(0xFFBDBDBD),
+    this.skeletonHighlightColor = const Color(0xFFFAFAFA),
     BucketScheme? scheme,
   }) : cache = cache ?? DiskCache(),
        _downloader = downloader ?? Downloader(),
@@ -90,6 +92,8 @@ class ImageHub {
     Duration cacheMaxAge = const Duration(days: 30),
     int cacheMaxBytes = 300 * 1024 * 1024,
     List<double> bucketThresholds = const [0.2, 0.6, 1.0],
+    Color skeletonBaseColor = const Color(0xFFBDBDBD),
+    Color skeletonHighlightColor = const Color(0xFFFAFAFA),
   }) {
     if (instance._used) {
       throw StateError(
@@ -104,6 +108,8 @@ class ImageHub {
       maxProcessing: maxProcessing,
       maxPixels: maxPixels,
       scheme: BucketScheme(bucketThresholds),
+      skeletonBaseColor: skeletonBaseColor,
+      skeletonHighlightColor: skeletonHighlightColor,
     );
   }
 
@@ -120,6 +126,8 @@ class ImageHub {
   final int maxDownloads;
   final int maxPixels;
   final BucketScheme scheme;
+  final Color skeletonBaseColor;
+  final Color skeletonHighlightColor;
   final _Gate _cpu;
 
   final _jobs = <String, _Job>{};
@@ -173,6 +181,11 @@ class ImageHub {
   /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
   Future<void> invalidate(String url, int tier, {String? cacheKey}) async {
     await _invalidateVariant(keyOf(url, cacheKey), 'b$tier');
+  }
+
+  /// Drops the cached XS preview file.
+  Future<void> invalidateXs(String url, {String? cacheKey}) async {
+    await _invalidateVariant(keyOf(url, cacheKey), 'xs');
   }
 
   Future<void> _invalidateVariant(String key, String variant) async {
