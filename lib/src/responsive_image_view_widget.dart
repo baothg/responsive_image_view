@@ -97,15 +97,14 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   }
 
   Future<void> _retry() async {
-    if (!mounted || _bucket == null) return;
-    if (_file != null) {
-      await ImageHub.instance.invalidate(
-        widget.url,
-        _bucket!,
-        cacheKey: widget.cacheKey,
-      );
-      if (!mounted) return;
-    }
+    final bucket = _bucket;
+    if (!mounted || bucket == null) return;
+    await ImageHub.instance.invalidate(
+      widget.url,
+      bucket,
+      cacheKey: widget.cacheKey,
+    );
+    if (!mounted) return;
     setState(() {
       _file = null;
       _error = null;

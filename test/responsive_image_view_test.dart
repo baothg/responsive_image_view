@@ -28,6 +28,19 @@ class _FakeDownloader extends Downloader {
   }
 }
 
+class _FailingDownloader extends Downloader {
+  static int calls = 0;
+  @override
+  Future<void> download(
+    String url,
+    File target, {
+    UrlRefresher? refresher,
+  }) async {
+    calls++;
+    throw DownloadException('boom', 500);
+  }
+}
+
 class _FakeResizer extends Resizer {
   final sizes = <Size>[];
   final sources = <String>[];
@@ -47,6 +60,12 @@ class _FakeResizer extends Resizer {
     active--;
     return Uint8List.fromList([9, 9]);
   }
+}
+
+Future<HttpServer> _serve(void Function(HttpResponse r) handler) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((req) => handler(req.response));
+  return server;
 }
 
 void main() {
@@ -78,6 +97,64 @@ void main() {
       DiskCache.keyFor('https://a.com/x.jpg?id=1'),
       isNot(DiskCache.keyFor('https://a.com/x.jpg?id=2')),
     );
+  });
+
+  group('downloader limits', () {
+    late Directory dir;
+    setUp(() {
+      HttpOverrides.global = null;
+      dir = Directory.systemTemp.createTempSync('ri');
+    });
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    test('rejects by Content-Length without retry', () async {
+      var hits = 0;
+      final server = await _serve((r) {
+        hits++;
+        r.contentLength = 5000;
+        r.add(List.filled(5000, 1));
+        r.close();
+      });
+      final target = File('${dir.path}/t');
+      await expectLater(
+        Downloader(maxBytes: 1000)
+            .download('http://127.0.0.1:${server.port}/a', target),
+        throwsA(isA<ImageTooLargeException>()),
+      );
+      expect(hits, 1);
+      expect(target.existsSync(), false);
+      await server.close(force: true);
+    });
+
+    test('rejects chunked stream that grows past the limit', () async {
+      final server = await _serve((r) {
+        r.headers.chunkedTransferEncoding = true;
+        for (var i = 0; i < 10; i++) {
+          r.add(List.filled(500, 1));
+        }
+        r.close();
+      });
+      final target = File('${dir.path}/t');
+      await expectLater(
+        Downloader(maxBytes: 1000)
+            .download('http://127.0.0.1:${server.port}/a', target),
+        throwsA(isA<ImageTooLargeException>()),
+      );
+      expect(target.existsSync(), false);
+      await server.close(force: true);
+    });
+
+    test('accepts file under the limit', () async {
+      final server = await _serve((r) {
+        r.add(List.filled(500, 1));
+        r.close();
+      });
+      final target = File('${dir.path}/t');
+      await Downloader(maxBytes: 1000)
+          .download('http://127.0.0.1:${server.port}/a', target);
+      expect(target.lengthSync(), 500);
+      await server.close(force: true);
+    });
   });
 
   group('with temp dir', () {
@@ -176,6 +253,40 @@ void main() {
         hub.request('u', SizeBucket.s, px, cacheKey: 'z').future,
       ]);
       expect(dl.calls, 1);
+    });
+
+    test('rejects images over the pixel limit', () async {
+      final hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: _FakeDownloader(),
+        resizer: _FakeResizer(),
+        maxPixels: 1000,
+      );
+      await expectLater(
+        hub
+            .request('u', SizeBucket.s, const Size(1200, 2400), cacheKey: 'big')
+            .future,
+        throwsA(isA<ImageTooLargeException>()),
+      );
+    });
+
+    test('failed image is not re-downloaded until invalidated', () async {
+      final hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: _FailingDownloader(),
+        resizer: _FakeResizer(),
+      );
+      const px = Size(1200, 2400);
+      Future<void> attempt() => hub
+          .request('u', SizeBucket.s, px, cacheKey: 'f')
+          .future
+          .then((_) {}, onError: (_) {});
+      await attempt();
+      await attempt();
+      expect(_FailingDownloader.calls, 1);
+      await hub.invalidate('u', SizeBucket.s, cacheKey: 'f');
+      await attempt();
+      expect(_FailingDownloader.calls, 2);
     });
 
     test('cancelled queued job is dropped', () async {

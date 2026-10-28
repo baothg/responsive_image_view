@@ -11,18 +11,28 @@ class DownloadException implements Exception {
   String toString() => 'DownloadException($statusCode): $message';
 }
 
+/// The image exceeds the configured byte or pixel limit. Never retried.
+class ImageTooLargeException implements Exception {
+  ImageTooLargeException(this.message);
+  final String message;
+  @override
+  String toString() => 'ImageTooLargeException: $message';
+}
+
 /// Streams a url to [target]. Retries network/5xx errors with backoff; for
 /// expired-link statuses (401/403/404/410) asks [refresher] for a fresh url.
 class Downloader {
   Downloader({
     HttpClient? client,
     this.maxAttempts = 3,
+    this.maxBytes = 30 * 1024 * 1024,
     this.retryDelay = const Duration(milliseconds: 500),
   }) : _client = (client ?? HttpClient())
          ..connectionTimeout = const Duration(seconds: 15);
 
   final HttpClient _client;
   final int maxAttempts;
+  final int maxBytes;
   final Duration retryDelay;
 
   static bool _expired(int s) => s == 401 || s == 403 || s == 404 || s == 410;
@@ -67,10 +77,27 @@ class Downloader {
       await res.drain<void>();
       throw DownloadException('HTTP ${res.statusCode}', res.statusCode);
     }
+    if (res.contentLength > maxBytes) {
+      await res.drain<void>().catchError((_) {});
+      throw ImageTooLargeException(
+        'Content-Length ${res.contentLength} > $maxBytes bytes',
+      );
+    }
     final sink = target.openWrite();
+    var received = 0;
     try {
-      await res.timeout(const Duration(seconds: 30)).pipe(sink);
+      await sink.addStream(
+        res.timeout(const Duration(seconds: 30)).map((chunk) {
+          received += chunk.length;
+          if (received > maxBytes) {
+            throw ImageTooLargeException('Download exceeded $maxBytes bytes');
+          }
+          return chunk;
+        }),
+      );
+      await sink.close();
     } catch (_) {
+      await sink.close().catchError((_) {});
       await target.delete().catchError((_) => target);
       rethrow;
     }

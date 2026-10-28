@@ -64,6 +64,7 @@ class ImageHub {
     Downloader? downloader,
     Resizer? resizer,
     this.maxDownloads = 6,
+    this.maxPixels = 100 * 1000 * 1000,
     int maxProcessing = 2,
   }) : cache = cache ?? DiskCache(),
        _downloader = downloader ?? Downloader(),
@@ -80,6 +81,7 @@ class ImageHub {
   final Downloader _downloader;
   final Resizer _resizer;
   final int maxDownloads;
+  final int maxPixels;
   final _Gate _cpu;
 
   final _jobs = <String, _Job>{};
@@ -87,6 +89,12 @@ class ImageHub {
   final _runningKeys = <String>{};
   int _running = 0;
   final _known = <String, File>{};
+  final _failures = <String, (DateTime, Object)>{};
+
+  /// A failed image is not retried automatically for this long (scrolling
+  /// back to it would otherwise re-download and fail again). `invalidate`
+  /// (used by the widget's retry) clears it.
+  static const failureTtl = Duration(seconds: 60);
 
   /// Cleans the disk cache and indexes surviving files so [peek] works from
   /// the first frame of a new session.
@@ -136,6 +144,7 @@ class ImageHub {
 
   Future<void> _invalidateKey(String key, SizeBucket bucket) async {
     _known.remove(_id(key, bucket));
+    _failures.remove(_id(key, bucket));
     await (await cache.fileFor(
       key,
       bucket,
@@ -151,6 +160,13 @@ class ImageHub {
   }) {
     final key = _keyOf(url, cacheKey);
     final id = _id(key, bucket);
+    final failed = _failures[id];
+    if (failed != null) {
+      if (DateTime.now().difference(failed.$1) < failureTtl) {
+        return ImageRequest._(Future<File>.error(failed.$2)..ignore(), () {});
+      }
+      _failures.remove(id);
+    }
     final job = _jobs.putIfAbsent(id, () {
       final j = _Job(key, url, bucket, screenPx, refresher);
       _queue.add(j);
@@ -181,7 +197,16 @@ class ImageHub {
       _running++;
       _runningKeys.add(job.key);
       _run(job)
-          .then(job.completer.complete, onError: job.completer.completeError)
+          .then(
+            job.completer.complete,
+            onError: (Object e, StackTrace st) {
+              if (_failures.length > 200) {
+                _failures.remove(_failures.keys.first);
+              }
+              _failures[_id(job.key, job.bucket)] = (DateTime.now(), e);
+              job.completer.completeError(e, st);
+            },
+          )
           .whenComplete(() {
             _jobs.remove(_id(job.key, job.bucket));
             _running--;
@@ -235,6 +260,11 @@ class ImageHub {
   /// so quality never degrades through repeated lossy re-encoding.
   Future<File> _process(_Job job, File source, List<SizeBucket> steps) async {
     final srcSize = await _resizer.dimensions(source);
+    if (srcSize.width * srcSize.height > maxPixels) {
+      throw ImageTooLargeException(
+        '${srcSize.width.round()}x${srcSize.height.round()} exceeds $maxPixels pixels',
+      );
+    }
     File? result;
     Size? lastTarget;
     List<int>? lastBytes;

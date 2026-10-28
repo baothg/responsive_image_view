@@ -19,6 +19,8 @@ ResponsiveImageView(
 - Disk cache per image and bucket; entries expire after 30 days from creation, oldest are evicted above 300MB. Signing query params (`X-Amz-*`, `Expires`, `Signature`, ...) are ignored in the cache key; override with `cacheKey`. A corrupt cached file is deleted and rebuilt automatically.
 - A hub admits up to 6 images at a time (newest request first, identical requests deduplicated, queued ones dropped when widgets are disposed) but runs at most 2 resize/encode steps concurrently. Files already on disk are indexed at startup so rebuilt list items show instantly without a placeholder flash.
 
+Limits: downloads over 30MB and images over 100 megapixels are rejected (`ImageTooLargeException`, never retried) before any heavy work. A failed image is not re-downloaded automatically for 60s; the `retry` callback in `errorBuilder` forces a reload.
+
 Only static raster images are supported. Animated images (GIF, animated WebP) are reduced to their first frame; SVG is not supported and reports an error.
 
 Platforms: Android, iOS.
