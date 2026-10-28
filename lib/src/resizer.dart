@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:isolate';
 import 'dart:ui' as ui;
 
@@ -12,7 +13,8 @@ class Resizer {
   const Resizer({this.quality = 80});
   final int quality;
 
-  /// Reads width/height from the header only (no full decode).
+  /// Reads width/height from the header only (no full decode). The engine
+  /// already applies EXIF orientation, matching what the native encoder uses.
   Future<ui.Size> dimensions(File f) async {
     final buffer = await ui.ImmutableBuffer.fromFilePath(f.path);
     try {
@@ -38,6 +40,7 @@ class Resizer {
         quality: quality,
         format: CompressFormat.webp,
         keepExif: false,
+        inSampleSize: _sampleSize(source, target),
       );
     } catch (e) {
       debugPrint('ResponsiveImage: native compress failed ($e), falling back to Dart');
@@ -47,6 +50,16 @@ class Resizer {
     if (noResize && out.length >= await src.length()) return src.readAsBytes();
     return out;
   }
+}
+
+int _sampleSize(ui.Size source, ui.Size target) {
+  var ratio = math.min(source.width / target.width, source.height / target.height);
+  var n = 1;
+  while (ratio >= 2) {
+    n *= 2;
+    ratio /= 2;
+  }
+  return n;
 }
 
 Uint8List _dartResize(String path, int w, int h, int quality, int sw, int sh) {

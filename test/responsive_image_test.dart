@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:responsive_image/src/disk_cache.dart';
 import 'package:responsive_image/src/downloader.dart';
 import 'package:responsive_image/src/image_hub.dart';
+import 'package:image/image.dart' as img;
 import 'package:responsive_image/src/resizer.dart';
 import 'package:responsive_image/src/size_bucket.dart';
 
@@ -108,5 +109,15 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect(dl.calls, lessThanOrEqualTo(1));
     });
+  });
+
+  test('dimensions are EXIF-oriented', () async {
+    final dir = Directory.systemTemp.createTempSync('ri');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final image = img.Image(width: 40, height: 20)..exif.imageIfd.orientation = 6;
+    final f = File('${dir.path}/a.jpg')..writeAsBytesSync(img.encodeJpg(image));
+    final plain = File('${dir.path}/b.jpg')..writeAsBytesSync(img.encodeJpg(img.Image(width: 40, height: 20)));
+    expect(await const Resizer().dimensions(f), const Size(20, 40));
+    expect(await const Resizer().dimensions(plain), const Size(40, 20));
   });
 }
