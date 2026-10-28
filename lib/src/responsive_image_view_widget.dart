@@ -42,6 +42,8 @@ class ResponsiveImageView extends StatefulWidget {
 class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   ImageRequest? _request;
   String? _sourceId;
+  SizeBucket? _bucket;
+  String? _retriedFor;
   String? _loadedFor;
   File? _file;
   Object? _error;
@@ -61,18 +63,51 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     _request = null;
     if (_sourceId != source) _file = null;
     _sourceId = source;
+    _bucket = bucket;
     _error = null;
-    final cached = ImageHub.instance.peek(widget.url, bucket, cacheKey: widget.cacheKey);
+    final cached = ImageHub.instance.peek(
+      widget.url,
+      bucket,
+      cacheKey: widget.cacheKey,
+    );
     if (cached != null) {
       _file = cached;
       return;
     }
-    final req = _request = ImageHub.instance.request(widget.url, bucket, screenPx,
-        cacheKey: widget.cacheKey, refresher: widget.urlRefresher);
-    req.future.then((f) {
-      if (mounted && _request == req) setState(() => _file = f);
-    }, onError: (Object e) {
-      if (mounted && _request == req && !isCancelled(e)) setState(() => _error = e);
+    final req = _request = ImageHub.instance.request(
+      widget.url,
+      bucket,
+      screenPx,
+      cacheKey: widget.cacheKey,
+      refresher: widget.urlRefresher,
+    );
+    req.future.then(
+      (f) {
+        if (mounted && _request == req) setState(() => _file = f);
+      },
+      onError: (Object e) {
+        if (mounted && _request == req && !isCancelled(e)) {
+          setState(() => _error = e);
+        }
+      },
+    );
+  }
+
+  void _onFileError() {
+    if (_retriedFor == _loadedFor) return;
+    _retriedFor = _loadedFor;
+    final bucket = _bucket!;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await ImageHub.instance.invalidate(
+        widget.url,
+        bucket,
+        cacheKey: widget.cacheKey,
+      );
+      if (!mounted) return;
+      setState(() {
+        _file = null;
+        _loadedFor = null;
+      });
     });
   }
 
@@ -80,14 +115,18 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   Widget build(BuildContext context) {
     final screen = MediaQuery.sizeOf(context);
     final dpr = MediaQuery.devicePixelRatioOf(context);
-    return LayoutBuilder(builder: (context, c) {
-      final w = widget.width ?? (c.hasBoundedWidth ? c.maxWidth : screen.width);
-      final h = widget.height ?? (c.hasBoundedHeight ? c.maxHeight : screen.height);
-      final bucket = SizeBucket.resolve(Size(w, h), screen);
-      _ensureLoaded(bucket, screen * dpr);
-      Widget child;
-      if (_file != null) {
-        child = Image.file(_file!,
+    return LayoutBuilder(
+      builder: (context, c) {
+        final w =
+            widget.width ?? (c.hasBoundedWidth ? c.maxWidth : screen.width);
+        final h =
+            widget.height ?? (c.hasBoundedHeight ? c.maxHeight : screen.height);
+        final bucket = SizeBucket.resolve(Size(w, h), screen);
+        _ensureLoaded(bucket, screen * dpr);
+        Widget child;
+        if (_file != null) {
+          child = Image.file(
+            _file!,
             key: ValueKey(_file!.path),
             width: widget.width,
             height: widget.height,
@@ -95,13 +134,23 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
             alignment: widget.alignment,
             cacheWidth: (w * dpr).round(),
             gaplessPlayback: true,
-            errorBuilder: widget.errorBuilder == null ? null : (ctx, e, _) => widget.errorBuilder!(ctx, e));
-      } else if (_error != null && widget.errorBuilder != null) {
-        child = widget.errorBuilder!(context, _error!);
-      } else {
-        child = widget.placeholder?.call(context) ?? const SizedBox.shrink();
-      }
-      return SizedBox(width: widget.width, height: widget.height, child: child);
-    });
+            errorBuilder: (ctx, e, _) {
+              _onFileError();
+              return widget.errorBuilder?.call(ctx, e) ??
+                  const SizedBox.shrink();
+            },
+          );
+        } else if (_error != null && widget.errorBuilder != null) {
+          child = widget.errorBuilder!(context, _error!);
+        } else {
+          child = widget.placeholder?.call(context) ?? const SizedBox.shrink();
+        }
+        return SizedBox(
+          width: widget.width,
+          height: widget.height,
+          child: child,
+        );
+      },
+    );
   }
 }

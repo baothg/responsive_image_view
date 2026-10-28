@@ -17,7 +17,8 @@ enum SizeBucket {
 
   /// Bucket for a widget of [widget] logical size on a [screen] logical size.
   static SizeBucket resolve(Size widget, Size screen) {
-    final ratio = (widget.width * widget.height) / (screen.width * screen.height);
+    final ratio =
+        (widget.width * widget.height) / (screen.width * screen.height);
     if (ratio < s.areaRatio) return s;
     if (ratio < m.areaRatio) return m;
     return l;
@@ -29,7 +30,9 @@ enum SizeBucket {
     final targetArea = areaRatio * screenPx.width * screenPx.height;
     final scale = math.sqrt(targetArea / (source.width * source.height));
     if (scale >= 1) return source;
-    return Size((source.width * scale).roundToDouble().clamp(1, double.infinity),
-        (source.height * scale).roundToDouble().clamp(1, double.infinity));
+    return Size(
+      (source.width * scale).roundToDouble().clamp(1, double.infinity),
+      (source.height * scale).roundToDouble().clamp(1, double.infinity),
+    );
   }
 }

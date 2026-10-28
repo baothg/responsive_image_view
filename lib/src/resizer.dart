@@ -7,6 +7,15 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image/image.dart' as img;
 
+/// Thrown when the downloaded data is not a supported static raster image
+/// (e.g. SVG or corrupt data). Animated images are reduced to their first frame.
+class UnsupportedImageException implements Exception {
+  UnsupportedImageException(this.message);
+  final String message;
+  @override
+  String toString() => 'UnsupportedImageException: $message';
+}
+
 /// Downscales (never upscales) and recompresses images.
 /// Native encoder (WebP) first, pure Dart (`image`) fallback.
 class Resizer {
@@ -18,7 +27,12 @@ class Resizer {
   Future<ui.Size> dimensions(File f) async {
     final buffer = await ui.ImmutableBuffer.fromFilePath(f.path);
     try {
-      final d = await ui.ImageDescriptor.encoded(buffer);
+      final ui.ImageDescriptor d;
+      try {
+        d = await ui.ImageDescriptor.encoded(buffer);
+      } catch (e) {
+        throw UnsupportedImageException('$e');
+      }
       final s = ui.Size(d.width.toDouble(), d.height.toDouble());
       d.dispose();
       return s;
@@ -30,8 +44,6 @@ class Resizer {
   /// Produces bytes of [src] scaled to [target] (equal to source size = no
   /// resize, only recompress). Returned bytes may be the original if smaller.
   Future<Uint8List> resize(File src, ui.Size source, ui.Size target) async {
-    final head = await _head(src);
-    if (head.length > 3 && head[0] == 0x47 && head[1] == 0x49 && head[2] == 0x46) return src.readAsBytes(); // GIF: keep animation
     final w = target.width.round(), h = target.height.round();
     Uint8List? bytes;
     try {
@@ -45,26 +57,33 @@ class Resizer {
         inSampleSize: _sampleSize(source, target),
       );
     } catch (e) {
-      debugPrint('ResponsiveImageView: native compress failed ($e), falling back to Dart');
+      debugPrint(
+        'ResponsiveImageView: native compress failed ($e), falling back to Dart',
+      );
     }
-    final Uint8List out = bytes ?? await Isolate.run<Uint8List>(() => _dartResize(src.path, w, h, quality, source.width.round(), source.height.round()));
+    final Uint8List out =
+        bytes ??
+        await Isolate.run<Uint8List>(
+          () => _dartResize(
+            src.path,
+            w,
+            h,
+            quality,
+            source.width.round(),
+            source.height.round(),
+          ),
+        );
     final noResize = target == source;
     if (noResize && out.length >= await src.length()) return src.readAsBytes();
     return out;
   }
 }
 
-Future<List<int>> _head(File f) async {
-  final raf = await f.open();
-  try {
-    return await raf.read(4);
-  } finally {
-    await raf.close();
-  }
-}
-
 int _sampleSize(ui.Size source, ui.Size target) {
-  var ratio = math.min(source.width / target.width, source.height / target.height);
+  var ratio = math.min(
+    source.width / target.width,
+    source.height / target.height,
+  );
   var n = 1;
   while (ratio >= 2) {
     n *= 2;
@@ -77,6 +96,15 @@ Uint8List _dartResize(String path, int w, int h, int quality, int sw, int sh) {
   var image = img.decodeImage(File(path).readAsBytesSync());
   if (image == null) throw const FormatException('Unsupported image');
   image = img.bakeOrientation(image);
-  if (w < sw || h < sh) image = img.copyResize(image, width: w, height: h, interpolation: img.Interpolation.average);
-  return image.hasAlpha ? img.encodePng(image, level: 6) : img.encodeJpg(image, quality: quality);
+  if (w < sw || h < sh) {
+    image = img.copyResize(
+      image,
+      width: w,
+      height: h,
+      interpolation: img.Interpolation.average,
+    );
+  }
+  return image.hasAlpha
+      ? img.encodePng(image, level: 6)
+      : img.encodeJpg(image, quality: quality);
 }

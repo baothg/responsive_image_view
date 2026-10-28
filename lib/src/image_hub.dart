@@ -28,43 +28,91 @@ class _Job {
   bool started = false;
 }
 
-/// Coordinates all image work: dedupes identical requests, runs at most
-/// [maxConcurrent] pipelines at once, newest request first (LIFO, so images
-/// currently on screen win over ones scrolled past).
+/// Limits concurrent async work; waiters are served newest first.
+class _Gate {
+  _Gate(this.limit);
+  final int limit;
+  int _active = 0;
+  final _waiters = <Completer<void>>[];
+
+  Future<T> run<T>(Future<T> Function() fn) async {
+    if (_active >= limit) {
+      final c = Completer<void>();
+      _waiters.add(c);
+      await c.future;
+    } else {
+      _active++;
+    }
+    try {
+      return await fn();
+    } finally {
+      if (_waiters.isNotEmpty) {
+        _waiters.removeLast().complete();
+      } else {
+        _active--;
+      }
+    }
+  }
+}
+
+/// Coordinates all image work: dedupes identical requests, admits at most
+/// [maxDownloads] jobs at once (newest first, so images currently on screen
+/// win over ones scrolled past) and runs at most [maxProcessing] CPU-heavy
+/// resize/encode steps at a time.
 class ImageHub {
   ImageHub({
     DiskCache? cache,
     Downloader? downloader,
     Resizer? resizer,
-    this.maxConcurrent = 3,
-  })  : cache = cache ?? DiskCache(),
-        _downloader = downloader ?? Downloader(),
-        _resizer = resizer ?? const Resizer() {
-    unawaited(this.cache.cleanup().catchError((_) {}));
+    this.maxDownloads = 6,
+    int maxProcessing = 2,
+  }) : cache = cache ?? DiskCache(),
+       _downloader = downloader ?? Downloader(),
+       _resizer = resizer ?? const Resizer(),
+       _cpu = _Gate(maxProcessing) {
+    unawaited(_warmUp());
   }
 
   static final ImageHub instance = ImageHub();
 
+  static const _knownCapacity = 2000;
+
   final DiskCache cache;
   final Downloader _downloader;
   final Resizer _resizer;
-  final int maxConcurrent;
+  final int maxDownloads;
+  final _Gate _cpu;
 
   final _jobs = <String, _Job>{};
   final _queue = ListQueue<_Job>();
   int _running = 0;
   final _known = <String, File>{};
 
+  /// Cleans the disk cache and indexes surviving files so [peek] works from
+  /// the first frame of a new session.
+  Future<void> _warmUp() async {
+    try {
+      for (final f in await cache.cleanup()) {
+        final name = f.uri.pathSegments.last;
+        if (name.endsWith('.img')) {
+          _remember(name.substring(0, name.length - 4), f);
+        }
+      }
+    } catch (_) {}
+  }
+
   void _remember(String id, File f) {
     _known.remove(id);
     _known[id] = f;
-    if (_known.length > 500) _known.remove(_known.keys.first);
+    if (_known.length > _knownCapacity) _known.remove(_known.keys.first);
   }
 
-  /// Synchronous lookup of a file already produced in this session (avoids a
-  /// placeholder flash when a list item is rebuilt).
+  String _id(String key, SizeBucket b) => '${key}_${b.name}';
+
+  /// Synchronous lookup of an already produced file (avoids a placeholder
+  /// flash when a list item is rebuilt).
   File? peek(String url, SizeBucket bucket, {String? cacheKey}) {
-    final id = '${cacheKey ?? DiskCache.keyFor(url)}_${bucket.name}';
+    final id = _id(cacheKey ?? DiskCache.keyFor(url), bucket);
     final f = _known[id];
     if (f == null) return null;
     if (!f.existsSync()) {
@@ -74,9 +122,29 @@ class ImageHub {
     return f;
   }
 
-  ImageRequest request(String url, SizeBucket bucket, Size screenPx, {String? cacheKey, UrlRefresher? refresher}) {
+  /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
+  Future<void> invalidate(
+    String url,
+    SizeBucket bucket, {
+    String? cacheKey,
+  }) async {
     final key = cacheKey ?? DiskCache.keyFor(url);
-    final id = '${key}_${bucket.name}';
+    _known.remove(_id(key, bucket));
+    await (await cache.fileFor(
+      key,
+      bucket,
+    )).delete().catchError((_) => File(''));
+  }
+
+  ImageRequest request(
+    String url,
+    SizeBucket bucket,
+    Size screenPx, {
+    String? cacheKey,
+    UrlRefresher? refresher,
+  }) {
+    final key = cacheKey ?? DiskCache.keyFor(url);
+    final id = _id(key, bucket);
     final job = _jobs.putIfAbsent(id, () {
       final j = _Job(key, url, bucket, screenPx, refresher);
       _queue.addLast(j);
@@ -97,64 +165,79 @@ class ImageHub {
   }
 
   void _pump() {
-    while (_running < maxConcurrent && _queue.isNotEmpty) {
+    while (_running < maxDownloads && _queue.isNotEmpty) {
       final job = _queue.removeLast();
       job.started = true;
       _running++;
-      _run(job).then(job.completer.complete, onError: job.completer.completeError).whenComplete(() {
-        _jobs.remove('${job.key}_${job.bucket.name}');
-        _running--;
-        _pump();
-      });
+      _run(job)
+          .then(job.completer.complete, onError: job.completer.completeError)
+          .whenComplete(() {
+            _jobs.remove(_id(job.key, job.bucket));
+            _running--;
+            _pump();
+          });
     }
   }
 
   Future<File> _run(_Job job) async {
     final hit = await cache.get(job.key, job.bucket);
     if (hit != null) {
-      _remember('${job.key}_${job.bucket.name}', hit);
+      _remember(_id(job.key, job.bucket), hit);
       return hit;
     }
 
     // Lazy: reuse the nearest larger cached bucket as source, else download.
-    File? source;
-    var from = SizeBucket.l;
     for (final b in job.bucket.sameOrLarger.skip(1)) {
       final f = await cache.get(job.key, b);
-      if (f != null) {
-        source = f;
-        from = b;
-        break;
+      if (f == null) continue;
+      try {
+        return await _process(job, f, [
+          for (final x in SizeBucket.values.reversed)
+            if (x.index >= job.bucket.index && x.index < b.index) x,
+        ]);
+      } catch (_) {
+        await invalidate(
+          job.url,
+          b,
+          cacheKey: job.key,
+        ); // corrupt source: fall back to a fresh download
       }
+      break;
     }
-    File? temp;
-    if (source == null) {
-      temp = await cache.tempFile('${job.key}_${DateTime.now().microsecondsSinceEpoch}');
-      await _downloader.download(job.url, temp, refresher: job.refresher);
-      source = temp;
-    }
+
+    final temp = await cache.tempFile(
+      '${job.key}_${DateTime.now().microsecondsSinceEpoch}',
+    );
     try {
-      // Chain L -> M -> S, each step from the previous output.
-      final steps = <SizeBucket>[
-        for (final b in SizeBucket.values.reversed)
-          if (b.index >= job.bucket.index && (temp != null || b.index < from.index)) b
-      ];
-      var srcSize = await _resizer.dimensions(source);
-      File? result;
-      for (final b in steps) {
-        final target = b.targetSize(srcSize, job.screenPx);
-        final bytes = result != null && target == srcSize
-            ? await source!.readAsBytes()
-            : await _resizer.resize(source!, srcSize, target);
-        result = await cache.put(job.key, b, bytes);
-        _remember('${job.key}_${b.name}', result);
-        source = result;
-        srcSize = target;
-      }
-      return result!;
+      await _downloader.download(job.url, temp, refresher: job.refresher);
+      return await _process(job, temp, [
+        for (final x in SizeBucket.values.reversed)
+          if (x.index >= job.bucket.index) x,
+      ]);
     } finally {
-      if (temp != null) await temp.delete().catchError((_) => temp!);
+      await temp.delete().catchError((_) => temp);
     }
+  }
+
+  /// Produces every bucket in [steps] (largest first) directly from [source],
+  /// so quality never degrades through repeated lossy re-encoding.
+  Future<File> _process(_Job job, File source, List<SizeBucket> steps) async {
+    final srcSize = await _resizer.dimensions(source);
+    File? result;
+    Size? lastTarget;
+    List<int>? lastBytes;
+    for (final b in steps) {
+      final target = b.targetSize(srcSize, job.screenPx);
+      if (target != lastTarget) {
+        lastBytes = await _cpu.run(
+          () => _resizer.resize(source, srcSize, target),
+        );
+        lastTarget = target;
+      }
+      result = await cache.put(job.key, b, lastBytes!);
+      _remember(_id(job.key, b), result);
+    }
+    return result!;
   }
 }
 

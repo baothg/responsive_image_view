@@ -14,8 +14,12 @@ class DownloadException implements Exception {
 /// Streams a url to [target]. Retries network/5xx errors with backoff; for
 /// expired-link statuses (401/403/404/410) asks [refresher] for a fresh url.
 class Downloader {
-  Downloader({HttpClient? client, this.maxAttempts = 3, this.retryDelay = const Duration(milliseconds: 500)})
-      : _client = (client ?? HttpClient())..connectionTimeout = const Duration(seconds: 15);
+  Downloader({
+    HttpClient? client,
+    this.maxAttempts = 3,
+    this.retryDelay = const Duration(milliseconds: 500),
+  }) : _client = (client ?? HttpClient())
+         ..connectionTimeout = const Duration(seconds: 15);
 
   final HttpClient _client;
   final int maxAttempts;
@@ -23,7 +27,11 @@ class Downloader {
 
   static bool _expired(int s) => s == 401 || s == 403 || s == 404 || s == 410;
 
-  Future<void> download(String url, File target, {UrlRefresher? refresher}) async {
+  Future<void> download(
+    String url,
+    File target, {
+    UrlRefresher? refresher,
+  }) async {
     Object? last;
     var current = url;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
@@ -51,7 +59,9 @@ class Downloader {
   }
 
   Future<void> _fetch(String url, File target) async {
-    final req = await _client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 15));
+    final req = await _client
+        .getUrl(Uri.parse(url))
+        .timeout(const Duration(seconds: 15));
     final res = await req.close().timeout(const Duration(seconds: 30));
     if (res.statusCode != 200) {
       await res.drain<void>();
