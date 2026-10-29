@@ -1219,4 +1219,124 @@ void main() {
       expect(t.takeException(), isNull);
     },
   );
+
+  testWidgets('lazy ctor never calls urlResolver on a cache hit', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_lz');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('lazy-key');
+    final png = img.encodePng(img.Image(width: 8, height: 8));
+    await t.runAsync(() => cache.put(key, 'b0', png));
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    var resolves = 0;
+    await t.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: SizedBox(
+          width: 72,
+          height: 72,
+          child: ResponsiveImageView.lazy(
+            cacheKey: 'lazy-key',
+            urlResolver: () async {
+              resolves++;
+              return 'http://x/late.jpg';
+            },
+            width: 72,
+            height: 72,
+          ),
+        ),
+      ),
+    );
+    await t.pump();
+    await t.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(resolves, 0); // cache hit: resolver never ran
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets('lazy ctor resolves the url only on a cache miss', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_lz2');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final dl = _RawDownloader(img.encodePng(img.Image(width: 8, height: 8)));
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    ImageHub.instance = hub;
+    var resolves = 0;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView.lazy(
+              cacheKey: 'lazy-miss',
+              urlResolver: () async {
+                resolves++;
+                return 'http://x/late.jpg';
+              },
+              width: 72,
+              height: 72,
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await t.pump();
+    });
+    await t.pump();
+    expect(resolves, 1); // resolved exactly once, after the miss
+    expect(dl.calls, 1); // and the resolved url was downloaded once
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets('lazy ctor surfaces a null resolution as an error', (t) async {
+    ImageHub.instance = ImageHub(
+      cache: DiskCache(
+        directory: Directory.systemTemp.createTempSync('ri_lz3')
+          ..deleteSync(recursive: true),
+      ),
+      downloader: _FailingDownloader(),
+    );
+    var errors = 0;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView.lazy(
+              cacheKey: 'lazy-null',
+              urlResolver: () async => null,
+              width: 72,
+              height: 72,
+              errorBuilder: (_, e, retry) {
+                errors++;
+                return const Text('err', textDirection: TextDirection.ltr);
+              },
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await t.pump();
+    });
+    expect(errors, greaterThan(0));
+    expect(t.takeException(), isNull);
+  });
 }

@@ -23,9 +23,37 @@ class ResponsiveImageView extends StatefulWidget {
     this.showOriginalImage = false,
     this.urlRefresher,
     this.cacheKey,
-  });
+    this.urlResolver,
+  }) : assert(
+         url != '' || urlResolver == null || cacheKey != null,
+         'urlResolver without a url requires cacheKey as the cache identity',
+       );
+
+  /// Variant that resolves the network url lazily — only when the disk
+  /// cache misses. [urlResolver] is therefore never invoked for cached
+  /// images (e.g. an S3 object key whose signed url has expired but whose
+  /// content is still cached).
+  const ResponsiveImageView.lazy({
+    super.key,
+    required this.cacheKey,
+    required this.urlResolver,
+    this.width,
+    this.height,
+    this.fit,
+    this.alignment = Alignment.center,
+    this.placeholder,
+    this.errorBuilder,
+    this.onLoaded,
+    this.showOriginalImage = false,
+    this.urlRefresher,
+  }) : url = '';
 
   final String url;
+
+  /// Resolves a url on demand; invoked only when a download is actually
+  /// needed. With [cacheKey] set, cache hits never call it. When
+  /// [urlRefresher] is absent it also serves as the 401/403 fallback.
+  final FutureOr<String?> Function()? urlResolver;
   final double? width;
   final double? height;
   final BoxFit? fit;
@@ -114,6 +142,9 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   _SvgLoader? _svgLoader;
   String? _keyPrefix;
   Object? _error;
+  String? _resolvedUrl;
+  Future<String?>? _resolving;
+  Size? _measuredSize;
 
   /// Preview quality rank: xs < b0 < b1 < ... — a produced variant only
   /// replaces the current preview when it is larger.
@@ -128,7 +159,10 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     super.didUpdateWidget(old);
     if (old.url != widget.url ||
         old.cacheKey != widget.cacheKey ||
+        old.urlResolver != widget.urlResolver ||
         old.showOriginalImage != widget.showOriginalImage) {
+      _resolvedUrl = null;
+      _resolving = null;
       _loadedFor = null;
       // Known-size widgets re-resolve inside the next build; for measured
       // sizes onSize only fires on size change, so re-trigger with the
@@ -159,6 +193,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       _previewVariant = null;
       _svg = false;
       _svgLoader = null;
+      _resolvedUrl = null;
+      _resolving = null;
     }
     _sourceId = source;
     _tier = tier;
@@ -193,12 +229,62 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
         _previewVariant = variant;
       });
     });
-    final req = _request = ImageHub.instance.request(
-      widget.url,
+    final forId = id;
+    final known = widget.url.isNotEmpty ? widget.url : _resolvedUrl;
+    if (known != null && known.isNotEmpty) {
+      _issueRequest(hub, known, tier, screenPx, original);
+    } else if (widget.urlResolver != null) {
+      // Lazy: the resolver only runs on a cache miss.
+      if (_resolving == null) {
+        late Future<String?> fut;
+        fut = _resolving = Future<String?>.value(widget.urlResolver!()).then((
+          u,
+        ) {
+          // Ignore a resolution that finished after the url/source moved on.
+          if (identical(_resolving, fut)) _resolvedUrl = u;
+          return u;
+        });
+      }
+      _resolving!.then(
+        (u) {
+          if (!mounted || _loadedFor != forId) return;
+          if (u == null || u.isEmpty) {
+            setState(
+              () => _error = StateError('urlResolver produced no usable url'),
+            );
+            return;
+          }
+          _issueRequest(hub, u, tier, screenPx, original);
+        },
+        onError: (Object e) {
+          if (mounted && _loadedFor == forId) setState(() => _error = e);
+        },
+      );
+    } else {
+      // Same behavior as before: an empty url is reported by the downloader.
+      _issueRequest(hub, widget.url, tier, screenPx, original);
+    }
+  }
+
+  /// Issues a hub request for [url] and wires its completion into state.
+  void _issueRequest(
+    ImageHub hub,
+    String url,
+    int tier,
+    Size screenPx,
+    bool original,
+  ) {
+    final resolver = widget.urlResolver;
+    final req = _request = hub.request(
+      url,
       tier,
       screenPx,
       cacheKey: widget.cacheKey,
-      refresher: widget.urlRefresher,
+      // The resolver doubles as the refresher: re-invoking it is exactly
+      // "give me a fresh url for this identity".
+      refresher:
+          widget.urlRefresher ??
+          (resolver == null ? null : (_) => Future<String?>.value(resolver())),
       original: original,
     );
     req.future.then(
@@ -238,6 +324,9 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       _error = null;
       _retriedFor = null;
       _loadedFor = null;
+      // A retry should re-resolve rather than reuse a possibly stale url.
+      _resolvedUrl = null;
+      _resolving = null;
     });
   }
 
@@ -308,6 +397,34 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
         ImageHub.instance.scheme.resolve(Size(mw, mh), screen),
         screenPx,
       );
+    } else {
+      // Rebuilds can resolve immediately: the previous frame's render
+      // object still carries its constraints. First mounts have no render
+      // object yet and must wait for the post-frame measure.
+      final box = context.findRenderObject();
+      if (box is RenderBox && box.hasSize) {
+        final size = box.size;
+        final biggest = box.constraints.biggest;
+        double pick(double? known, double painted, double cap, double full) =>
+            known ?? (painted > 0 ? painted : (cap.isFinite ? cap : full));
+        final realW = pick(mw, size.width, biggest.width, screen.width);
+        final realH = pick(mh, size.height, biggest.height, screen.height);
+        _measuredSize = Size(realW, realH);
+        _ensureLoaded(
+          ImageHub.instance.scheme.resolve(_measuredSize!, screen),
+          screenPx,
+        );
+      }
+      // Best-effort preview on the first frame, before measurement lands:
+      // show the largest cached variant instead of a bare skeleton.
+      if (_preview == null) {
+        final pv = ImageHub.instance.peekBestPreview(
+          widget.url,
+          cacheKey: widget.cacheKey,
+        );
+        _preview = pv?.file;
+        _previewVariant = pv?.variant;
+      }
     }
     return _MeasuredSize(
       enabled: mw == null || mh == null,
@@ -320,6 +437,7 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
             known ?? (painted > 0 ? painted : (cap.isFinite ? cap : full));
         final realW = pick(mw, size.width, biggest.width, screen.width);
         final realH = pick(mh, size.height, biggest.height, screen.height);
+        _measuredSize = Size(realW, realH);
         // Runs outside build, so state changes must trigger a rebuild.
         setState(
           () => _ensureLoaded(
@@ -384,8 +502,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               // bucketed images are still capped at display size for memory.
               cacheWidth: widget.showOriginalImage
                   ? null
-                  : (mw ?? screen.width) * dpr > 0
-                  ? ((mw ?? screen.width) * dpr).round()
+                  : (mw ?? _measuredSize?.width ?? screen.width) * dpr > 0
+                  ? ((mw ?? _measuredSize?.width ?? screen.width) * dpr).round()
                   : null,
               gaplessPlayback: true,
               frameBuilder: (ctx, child, frame, _) {
@@ -410,8 +528,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               height: h,
               fit: widget.fit,
               alignment: widget.alignment,
-              cacheWidth: (mw ?? screen.width) * dpr > 0
-                  ? ((mw ?? screen.width) * dpr).round()
+              cacheWidth: (mw ?? _measuredSize?.width ?? screen.width) * dpr > 0
+                  ? ((mw ?? _measuredSize?.width ?? screen.width) * dpr).round()
                   : null,
               gaplessPlayback: true,
               errorBuilder: (_, _, _) {
