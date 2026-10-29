@@ -41,6 +41,9 @@ class Demo extends StatelessWidget {
                         child: ResponsiveImageView(
                           urls[(index + j) % urls.length],
                           fit: BoxFit.cover,
+                          onLoaded: (f) => debugPrint(
+                            'RIV loaded ${f.path.split('/').last}',
+                          ),
                           errorBuilder: (_, _, retry) => IconButton(
                             icon: const Icon(Icons.refresh),
                             onPressed: retry,

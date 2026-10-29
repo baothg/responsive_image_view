@@ -1,12 +1,12 @@
 name: responsive_image_view
 description: "Network image widget that downloads once, downscales to S/M/L buckets by screen area and caches on disk."
 version: 0.0.1
-repository: https://github.com/baothg/responsive_image
+repository: https://github.com/baothg/responsive_image_view
 publish_to: none
 
 environment:
-  sdk: ^3.13.5
-  flutter: ">=1.17.0"
+  sdk: ">=3.12.2 <4.0.0"
+  flutter: ">=3.44.9"
 
 dependencies:
   crypto: ^3.0.8

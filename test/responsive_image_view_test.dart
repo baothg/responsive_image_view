@@ -104,13 +104,21 @@ void main() {
     expect(BucketScheme([0.5, 1.0]).resolve(const Size(100, 400), screen), 0);
     expect(BucketScheme([0.5, 1.0]).resolve(const Size(400, 800), screen), 1);
     expect(
-      BucketScheme([0.1, 0.33, 0.66, 1.0])
-          .resolve(const Size(100, 100), screen),
+      BucketScheme([
+        0.1,
+        0.33,
+        0.66,
+        1.0,
+      ]).resolve(const Size(100, 100), screen),
       0,
     );
     expect(
-      BucketScheme([0.1, 0.33, 0.66, 1.0])
-          .resolve(const Size(500, 400), screen),
+      BucketScheme([
+        0.1,
+        0.33,
+        0.66,
+        1.0,
+      ]).resolve(const Size(500, 400), screen),
       2,
     );
     expect(() => BucketScheme([0.5]), throwsArgumentError);
@@ -157,8 +165,9 @@ void main() {
       });
       final target = File('${dir.path}/t');
       await expectLater(
-        Downloader(maxBytes: 1000)
-            .download('http://127.0.0.1:${server.port}/a', target),
+        Downloader(
+          maxBytes: 1000,
+        ).download('http://127.0.0.1:${server.port}/a', target),
         throwsA(isA<ImageTooLargeException>()),
       );
       expect(hits, 1);
@@ -176,8 +185,9 @@ void main() {
       });
       final target = File('${dir.path}/t');
       await expectLater(
-        Downloader(maxBytes: 1000)
-            .download('http://127.0.0.1:${server.port}/a', target),
+        Downloader(
+          maxBytes: 1000,
+        ).download('http://127.0.0.1:${server.port}/a', target),
         throwsA(isA<ImageTooLargeException>()),
       );
       expect(target.existsSync(), false);
@@ -246,8 +256,9 @@ void main() {
         r.close();
       });
       final target = File('${dir.path}/t');
-      await Downloader(maxBytes: 1000)
-          .download('http://127.0.0.1:${server.port}/a', target);
+      await Downloader(
+        maxBytes: 1000,
+      ).download('http://127.0.0.1:${server.port}/a', target);
       expect(target.lengthSync(), 500);
       await server.close(force: true);
     });
@@ -524,4 +535,91 @@ void main() {
       },
     );
   }
+
+  testWidgets('onLoaded fires once after decode, incl. cache hit', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_l');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('load-key');
+    final png = img.encodePng(img.Image(width: 8, height: 8));
+    await t.runAsync(() async {
+      await cache.put(key, 'b0', png);
+      await cache.put(key, 'xs', png);
+    });
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    var calls = 0;
+    File? got;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/a.jpg',
+              cacheKey: 'load-key',
+              width: 72,
+              height: 72,
+              onLoaded: (f) {
+                calls++;
+                got = f;
+              },
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await t.pump();
+    });
+    await t.pump();
+    expect(calls, 1);
+    expect(got!.path, contains('_b0'));
+  });
+
+  testWidgets('onLoaded is not fired for the XS preview', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_l2');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('xs-key');
+    await t.runAsync(
+      () => cache.put(key, 'xs', img.encodePng(img.Image(width: 8, height: 8))),
+    );
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    var calls = 0;
+    await t.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: SizedBox(
+          width: 72,
+          height: 72,
+          child: ResponsiveImageView(
+            'http://x/b.jpg',
+            cacheKey: 'xs-key',
+            width: 72,
+            height: 72,
+            onLoaded: (_) => calls++,
+          ),
+        ),
+      ),
+    );
+    await t.pump();
+    await t.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await t.pump();
+    expect(find.byType(ResponsiveImageSkeleton), findsNothing);
+    expect(calls, 0);
+  });
 }

@@ -18,6 +18,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.alignment = Alignment.center,
     this.placeholder,
     this.errorBuilder,
+    this.onLoaded,
     this.urlRefresher,
     this.cacheKey,
   });
@@ -32,6 +33,12 @@ class ResponsiveImageView extends StatefulWidget {
   /// Builds the error state. Call [retry] (e.g. from a button) to reload the image.
   final Widget Function(BuildContext context, Object error, VoidCallback retry)?
   errorBuilder;
+
+  /// Called once per (url, size) after the target image's first frame has
+  /// been decoded — including when served from cache. Not called for the
+  /// XS preview, and not again on rebuilds. Useful for e.g. deleting a
+  /// local temp photo only after its uploaded network copy renders.
+  final void Function(File file)? onLoaded;
 
   /// Called when the url looks expired (401/403/404/410) to obtain a fresh one.
   final Future<String?> Function(String expiredUrl)? urlRefresher;
@@ -156,6 +163,20 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     });
   }
 
+  String? _notifiedFor;
+
+  void _notifyLoaded() {
+    final f = _file;
+    if (f == null || _notifiedFor == _loadedFor) return;
+    _notifiedFor = _loadedFor;
+    // ignore: avoid_print
+    final cb = widget.onLoaded;
+    if (cb == null) return;
+    scheduleMicrotask(() {
+      if (mounted && _file == f) cb(f);
+    });
+  }
+
   void _onFileError() {
     if (_retriedFor == _loadedFor) return;
     _retriedFor = _loadedFor;
@@ -215,6 +236,11 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               alignment: widget.alignment,
               cacheWidth: ((w ?? screen.width) * dpr).round(),
               gaplessPlayback: true,
+              frameBuilder: (ctx, child, frame, _) {
+                // ignore: avoid_print
+                if (frame != null) _notifyLoaded();
+                return child;
+              },
               errorBuilder: (ctx, e, _) {
                 _onFileError();
                 return widget.errorBuilder?.call(ctx, e, _retry) ??

@@ -44,5 +44,5 @@ Platforms: Android, iOS.
 ```yaml
 dependencies:
   responsive_image_view:
-    git: https://github.com/baothg/responsive_image.git
+    git: https://github.com/baothg/responsive_image_view.git
 ```
