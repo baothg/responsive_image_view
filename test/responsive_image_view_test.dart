@@ -319,10 +319,9 @@ void main() {
         r.close();
       });
       await expectLater(
-        Downloader(retryDelay: Duration.zero).download(
-          'http://127.0.0.1:${server.port}/x',
-          File('${dir.path}/nf'),
-        ),
+        Downloader(
+          retryDelay: Duration.zero,
+        ).download('http://127.0.0.1:${server.port}/x', File('${dir.path}/nf')),
         throwsA(
           isA<DownloadException>()
               .having((e) => e.statusCode, 'statusCode', 403)
@@ -349,6 +348,51 @@ void main() {
         throwsA(isA<ImageNotFoundException>()),
       );
       expect(hits, 2);
+      await server.close(force: true);
+    });
+
+    test('auth-expired status calls the refresher at most once', () async {
+      var hits = 0;
+      var refresherCalls = 0;
+      // e.g. S3 answering 403 for a missing object: refreshing can never
+      // help, so it must not be invoked once per retry.
+      final server = await _serveReq((req, r) {
+        hits++;
+        r.statusCode = 403;
+        r.close();
+      });
+      final base = 'http://127.0.0.1:${server.port}';
+      await expectLater(
+        Downloader(retryDelay: Duration.zero, maxAttempts: 3).download(
+          '$base/gone',
+          File('${dir.path}/gone'),
+          refresher: (_) async {
+            refresherCalls++;
+            return '$base/gone2';
+          },
+        ),
+        throwsA(isA<DownloadException>()),
+      );
+      expect(hits, 2); // original + one refreshed attempt, then fail fast
+      expect(refresherCalls, 1);
+      await server.close(force: true);
+    });
+
+    test('maxAttempts bounds the total number of tries', () async {
+      var hits = 0;
+      final server = await _serve((r) {
+        hits++;
+        r.statusCode = 500;
+        r.close();
+      });
+      await expectLater(
+        Downloader(
+          maxAttempts: 1,
+          retryDelay: Duration.zero,
+        ).download('http://127.0.0.1:${server.port}/x', File('${dir.path}/ma')),
+        throwsA(isA<DownloadException>()),
+      );
+      expect(hits, 1);
       await server.close(force: true);
     });
 
@@ -643,6 +687,87 @@ void main() {
       }
     });
 
+    test(
+      'original request stores one org file + xs, no bucket variants',
+      () async {
+        final cache = DiskCache(directory: dir);
+        final dl = _RawDownloader(utf8.encode('raster-ish-bytes'));
+        final rs = _FakeResizer();
+        final hub = ImageHub(cache: cache, downloader: dl, resizer: rs);
+        const px = Size(1200, 2400);
+        final r = await hub
+            .request('u', 0, px, cacheKey: 'o', original: true)
+            .future;
+        expect(r.svg, isFalse);
+        expect(r.file.path, endsWith('_org.img'));
+        expect(r.file.existsSync(), isTrue);
+        final key = DiskCache.hash('o');
+        expect(await cache.get(key, 'b0'), isNull);
+        expect(await cache.get(key, 'b2'), isNull);
+        expect(await cache.get(key, 'xs'), isNotNull); // preview produced
+        // Only the XS resize ran — the original itself is stored as-is.
+        expect(rs.sizes.length, 1);
+        // peekOriginal sees it; plain peek does not mistake it for a bucket.
+        expect(hub.peekOriginal('u', cacheKey: 'o')!.file.path, r.file.path);
+        expect(hub.peek('u', 0, cacheKey: 'o'), isNull);
+        // A second original request at another tier dedupes — no re-download.
+        await hub.request('u', 2, px, cacheKey: 'o', original: true).future;
+        expect(dl.calls, 1);
+        // And a bucket request now derives from the cached original.
+        rs.sources.clear();
+        await hub.request('u', 0, px, cacheKey: 'o').future;
+        expect(rs.sources, isNotEmpty);
+        expect(rs.sources.first, r.file.path); // resized FROM the original
+        expect(dl.calls, 1);
+        // Invalidating drops the original.
+        await hub.invalidateOrg('u', cacheKey: 'o');
+        expect(hub.peekOriginal('u', cacheKey: 'o'), isNull);
+      },
+    );
+
+    test('svg url serves an original request from the svg variant', () async {
+      final cache = DiskCache(directory: dir);
+      await cache.put(DiskCache.hash('os'), 'svg', utf8.encode(_svgBody));
+      final dl = _RawDownloader(utf8.encode('unused'));
+      final hub = ImageHub(
+        cache: cache,
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final r = await hub
+          .request(
+            'u',
+            0,
+            const Size(1200, 2400),
+            cacheKey: 'os',
+            original: true,
+          )
+          .future;
+      expect(r.svg, isTrue);
+      expect(dl.calls, 0); // served from cache, nothing downloaded
+    });
+
+    test('best preview prefers the largest cached variant over xs', () async {
+      final cache = DiskCache(directory: dir);
+      final key = DiskCache.hash('bp');
+      await cache.put(key, 'xs', [1]);
+      await cache.put(key, 'b0', [3]);
+      await cache.put(key, 'b1', [2]);
+      final hub = ImageHub(
+        cache: cache,
+        downloader: _RawDownloader(utf8.encode('x')),
+        resizer: _FakeResizer(),
+      );
+      // _warmUp indexes existing files.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      // b1 outranks both b0 and xs.
+      expect(
+        hub.peekBestPreview('u', cacheKey: 'bp')!.file.path,
+        endsWith('_b1.img'),
+      );
+    });
+
     test('cancelled queued job is dropped', () async {
       final dl = _FakeDownloader();
       final hub = ImageHub(
@@ -912,6 +1037,143 @@ void main() {
     });
     await t.pump();
     expect(find.text('err'), findsOneWidget);
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets('non-finite width/height do not crash the build', (t) async {
+    ImageHub.instance = ImageHub(
+      cache: DiskCache(
+        directory: Directory.systemTemp.createTempSync('ri_inf')
+          ..deleteSync(recursive: true),
+      ),
+      downloader: _FailingDownloader(),
+    );
+    for (final dims in [
+      (double.infinity, 100.0),
+      (100.0, double.infinity),
+      (double.nan, double.nan),
+      (double.negativeInfinity, 50.0),
+      (-10.0, -10.0),
+    ]) {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 200,
+            height: 200,
+            child: ResponsiveImageView(
+              'http://x/i.jpg',
+              width: dims.$1,
+              height: dims.$2,
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+    }
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets(
+    'loose constraints use offered space, not screen, for tier pick',
+    (t) async {
+      final dir = Directory.systemTemp.createTempSync('ri_loose');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final cache = DiskCache(directory: dir);
+      final key = DiskCache.hash('loose-key');
+      final png = img.encodePng(img.Image(width: 8, height: 8));
+      // Only the smallest tier is cached: if the widget resolved the screen
+      // size (tier 2) it would miss cache and error instead of showing it.
+      await t.runAsync(() => cache.put(key, 'b0', png));
+      late ImageHub hub;
+      await t.runAsync(() async {
+        hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      ImageHub.instance = hub;
+      await t.pumpWidget(
+        const Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(
+            child: SizedBox(
+              width: 800,
+              height: 600,
+              child: Center(child: SizedBox.shrink()),
+            ),
+          ),
+        ),
+      );
+      // Rebuild with the actual widget under loose (0..100) constraints.
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 100, maxHeight: 100),
+              child: const ResponsiveImageView(
+                'http://x/l.jpg',
+                cacheKey: 'loose-key',
+              ),
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await t.pump();
+      expect(find.byType(Image), findsOneWidget);
+      expect(t.takeException(), isNull);
+    },
+  );
+
+  testWidgets('showOriginalImage renders cached org and fires onLoaded', (
+    t,
+  ) async {
+    final dir = Directory.systemTemp.createTempSync('ri_org');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('org-key');
+    final png = img.encodePng(img.Image(width: 8, height: 8));
+    await t.runAsync(() async {
+      await cache.put(key, 'org', png);
+      await cache.put(key, 'b0', png); // best preview while org is unknown
+    });
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    var calls = 0;
+    File? got;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/o.jpg',
+              cacheKey: 'org-key',
+              width: 72,
+              height: 72,
+              showOriginalImage: true,
+              onLoaded: (f) {
+                calls++;
+                got = f;
+              },
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await t.pump();
+    });
+    await t.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(calls, 1);
+    expect(got!.path, contains('_org'));
     expect(t.takeException(), isNull);
   });
 }

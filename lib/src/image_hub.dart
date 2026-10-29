@@ -16,12 +16,25 @@ class ImageRequest {
 }
 
 class _Job {
-  _Job(this.key, this.url, this.tier, this.screenPx, this.refresher);
+  _Job(
+    this.key,
+    this.url,
+    this.tier,
+    this.screenPx,
+    this.refresher,
+    this.original,
+  ) : variant = original ? 'org' : 'b$tier';
   final String key;
   final String url;
   final int tier;
   final Size screenPx;
   final UrlRefresher? refresher;
+
+  /// Fetches the untouched original file instead of a resized bucket.
+  final bool original;
+
+  /// Cache variant this job produces ('org' or `bN`).
+  final String variant;
   final completer = Completer<({File file, bool svg})>()..future.ignore();
   int listeners = 0;
   bool started = false;
@@ -87,6 +100,7 @@ class ImageHub {
     int maxDownloads = 6,
     int maxProcessing = 2,
     int maxDownloadBytes = 30 * 1024 * 1024,
+    int maxAttempts = 3,
     int maxPixels = 100 * 1000 * 1000,
     int quality = 80,
     Duration cacheMaxAge = const Duration(days: 30),
@@ -102,7 +116,10 @@ class ImageHub {
     }
     instance = ImageHub(
       cache: DiskCache(maxAge: cacheMaxAge, maxBytes: cacheMaxBytes),
-      downloader: Downloader(maxBytes: maxDownloadBytes),
+      downloader: Downloader(
+        maxBytes: maxDownloadBytes,
+        maxAttempts: maxAttempts,
+      ),
       resizer: Resizer(quality: quality),
       maxDownloads: maxDownloads,
       maxProcessing: maxProcessing,
@@ -182,19 +199,53 @@ class ImageHub {
   File? peekXs(String url, {String? cacheKey}) =>
       _known[_id(keyOf(url, cacheKey), 'xs')]?.$1;
 
+  /// The best already-cached preview for progressive display: the largest
+  /// available bucket variant, else the XS preview.
+  ({File file, String variant})? peekBestPreview(
+    String url, {
+    String? cacheKey,
+  }) {
+    final key = keyOf(url, cacheKey);
+    for (var i = scheme.count - 1; i >= 0; i--) {
+      final f = _known[_id(key, 'b$i')];
+      if (f != null) return (file: f.$1, variant: 'b$i');
+    }
+    final xs = _known[_id(key, 'xs')];
+    return xs == null ? null : (file: xs.$1, variant: 'xs');
+  }
+
+  /// The cached untouched original (or SVG, which is inherently original).
+  ({File file, bool svg})? peekOriginal(String url, {String? cacheKey}) {
+    final key = keyOf(url, cacheKey);
+    final hit = _known[_id(key, 'svg')] ?? _known[_id(key, 'org')];
+    return hit == null ? null : (file: hit.$1, svg: hit.$2);
+  }
+
   /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
   Future<void> invalidate(String url, int tier, {String? cacheKey}) async {
     await _invalidateVariant(keyOf(url, cacheKey), 'b$tier');
   }
 
   /// Drops the cached XS preview file.
-  Future<void> invalidateXs(String url, {String? cacheKey}) async {
-    await _invalidateVariant(keyOf(url, cacheKey), 'xs');
-  }
+  Future<void> invalidateXs(String url, {String? cacheKey}) =>
+      invalidateVariant(url, 'xs', cacheKey: cacheKey);
 
   /// Drops the cached SVG file.
-  Future<void> invalidateSvg(String url, {String? cacheKey}) async {
-    await _invalidateVariant(keyOf(url, cacheKey), 'svg');
+  Future<void> invalidateSvg(String url, {String? cacheKey}) =>
+      invalidateVariant(url, 'svg', cacheKey: cacheKey);
+
+  /// Drops the cached original file.
+  Future<void> invalidateOrg(String url, {String? cacheKey}) =>
+      invalidateVariant(url, 'org', cacheKey: cacheKey);
+
+  /// Drops the cached file for an arbitrary [variant]
+  /// ('xs', 'svg', 'org', 'b0'...).
+  Future<void> invalidateVariant(
+    String url,
+    String variant, {
+    String? cacheKey,
+  }) async {
+    await _invalidateVariant(keyOf(url, cacheKey), variant);
   }
 
   Future<void> _invalidateVariant(String key, String variant) async {
@@ -213,9 +264,10 @@ class ImageHub {
     Size screenPx, {
     String? cacheKey,
     UrlRefresher? refresher,
+    bool original = false,
   }) {
     final key = keyOf(url, cacheKey);
-    final id = _id(key, 'b$tier');
+    final id = _id(key, original ? 'org' : 'b$tier');
     final failed = _failures[id];
     if (failed != null) {
       if (DateTime.now().difference(failed.$1) < failureTtl) {
@@ -228,7 +280,7 @@ class ImageHub {
     }
     _used = true;
     final job = _jobs.putIfAbsent(id, () {
-      final j = _Job(key, url, tier, screenPx, refresher);
+      final j = _Job(key, url, tier, screenPx, refresher, original);
       _queue.add(j);
       scheduleMicrotask(_pump);
       return j;
@@ -263,12 +315,12 @@ class ImageHub {
               if (_failures.length > 200) {
                 _failures.remove(_failures.keys.first);
               }
-              _failures[_id(job.key, 'b${job.tier}')] = (DateTime.now(), e);
+              _failures[_id(job.key, job.variant)] = (DateTime.now(), e);
               job.completer.completeError(e, st);
             },
           )
           .whenComplete(() {
-            _jobs.remove(_id(job.key, 'b${job.tier}'));
+            _jobs.remove(_id(job.key, job.variant));
             _running--;
             _runningKeys.remove(job.key);
             _pump();
@@ -282,32 +334,54 @@ class ImageHub {
       _remember(_id(job.key, 'svg'), svgHit, svg: true);
       return (file: svgHit, svg: true);
     }
-    final variant = 'b${job.tier}';
-    final hit = await cache.get(job.key, variant);
-    if (hit != null) {
-      _remember(_id(job.key, variant), hit);
-      return (file: hit, svg: false);
-    }
-
-    // Lazy: reuse the *nearest* larger cached tier as source, else download.
-    for (var i = job.tier + 1; i < scheme.count; i++) {
-      final v = 'b$i';
-      final f = await cache.get(job.key, v);
-      if (f == null) continue;
-      try {
-        return (
-          file: await _process(job, f, [
-            for (var x = i - 1; x >= job.tier; x--) 'b$x',
-          ]),
-          svg: false,
-        );
-      } catch (_) {
-        await _invalidateVariant(
-          job.key,
-          v,
-        ); // corrupt source: fall back to a fresh download
+    if (job.original) {
+      final orgHit = await cache.get(job.key, 'org');
+      if (orgHit != null) {
+        _remember(_id(job.key, 'org'), orgHit);
+        return (file: orgHit, svg: false);
       }
-      break;
+    } else {
+      final hit = await cache.get(job.key, job.variant);
+      if (hit != null) {
+        _remember(_id(job.key, job.variant), hit);
+        return (file: hit, svg: false);
+      }
+
+      // The cached original is the highest-fidelity resize source.
+      final org = await cache.get(job.key, 'org');
+      if (org != null) {
+        try {
+          return (
+            file: await _process(job, org, [
+              for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
+            ]),
+            svg: false,
+          );
+        } catch (_) {
+          await _invalidateVariant(job.key, 'org');
+        }
+      }
+
+      // Lazy: reuse the *nearest* larger cached tier as source, else download.
+      for (var i = job.tier + 1; i < scheme.count; i++) {
+        final v = 'b$i';
+        final f = await cache.get(job.key, v);
+        if (f == null) continue;
+        try {
+          return (
+            file: await _process(job, f, [
+              for (var x = i - 1; x >= job.tier; x--) 'b$x',
+            ]),
+            svg: false,
+          );
+        } catch (_) {
+          await _invalidateVariant(
+            job.key,
+            v,
+          ); // corrupt source: fall back to a fresh download
+        }
+        break;
+      }
     }
 
     // Retry once when the download decoded as corrupt (e.g. a truncated
@@ -323,6 +397,9 @@ class ImageHub {
           _remember(_id(job.key, 'svg'), f, svg: true);
           return (file: f, svg: true);
         }
+        if (job.original) {
+          return (file: await _adoptOriginal(job, temp), svg: false);
+        }
         return (
           file: await _process(job, temp, [
             for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
@@ -336,6 +413,48 @@ class ImageHub {
       }
     }
     throw StateError('unreachable');
+  }
+
+  /// Validates [temp] as a displayable raster source, stores it as the
+  /// cached untouched original and produces the XS preview for progressive
+  /// display. No bucket variants are produced on this path.
+  Future<File> _adoptOriginal(_Job job, File temp) async {
+    final srcSize = await _resizer.dimensions(temp);
+    if (srcSize.width < 4 || srcSize.height < 4) {
+      throw CorruptImageException(
+        'implausibly small source ${srcSize.width.round()}x${srcSize.height.round()}',
+      );
+    }
+    if (srcSize.width * srcSize.height > maxPixels) {
+      throw ImageTooLargeException(
+        '${srcSize.width.round()}x${srcSize.height.round()} exceeds $maxPixels pixels',
+      );
+    }
+    final f = await cache.adopt(job.key, 'org', temp);
+    _remember(_id(job.key, 'org'), f);
+    // The preview is progressive-only: it must never sink the original.
+    try {
+      await _ensureXs(job, f, srcSize);
+    } catch (_) {}
+    return f;
+  }
+
+  /// Produces the XS preview variant if it does not exist yet and emits it
+  /// to listeners. Shared by the bucket pipeline and the original path.
+  Future<void> _ensureXs(_Job job, File source, Size srcSize) async {
+    if (await cache.get(job.key, 'xs') != null) return;
+    final f = await cache.put(
+      job.key,
+      'xs',
+      await _cpu.run(
+        () => _resizer.resize(
+          source,
+          srcSize,
+          xsTier.targetSize(srcSize, job.screenPx),
+        ),
+      ),
+    );
+    _remember(_id(job.key, 'xs'), f);
   }
 
   /// Produces every variant in [steps] (largest first) directly from [source],
@@ -356,20 +475,7 @@ class ImageHub {
         '${srcSize.width.round()}x${srcSize.height.round()} exceeds $maxPixels pixels',
       );
     }
-    if (await cache.get(job.key, 'xs') == null) {
-      final f = await cache.put(
-        job.key,
-        'xs',
-        await _cpu.run(
-          () => _resizer.resize(
-            source,
-            srcSize,
-            xsTier.targetSize(srcSize, job.screenPx),
-          ),
-        ),
-      );
-      _remember(_id(job.key, 'xs'), f);
-    }
+    await _ensureXs(job, source, srcSize);
     File? result;
     Size? lastTarget;
     List<int>? lastBytes;

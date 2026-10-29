@@ -20,6 +20,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.placeholder,
     this.errorBuilder,
     this.onLoaded,
+    this.showOriginalImage = false,
     this.urlRefresher,
     this.cacheKey,
   });
@@ -47,10 +48,19 @@ class ResponsiveImageView extends StatefulWidget {
   /// they surface as [ImageNotFoundException] in [errorBuilder].
   final Future<String?> Function(String expiredUrl)? urlRefresher;
 
+  /// Downloads and displays the untouched original file instead of a
+  /// resized bucket. Progressive display still applies: skeleton, then the
+  /// best cached preview (largest bucket variant, else XS), then the
+  /// original. The original is cached as a single file — no bucket variants
+  /// are produced — and can serve as the resize source for later requests.
+  final bool showOriginalImage;
+
   /// Overrides the default cache identity (url without signing query params).
   final String? cacheKey;
 
   /// Tunes download/resize concurrency, size limits, quality and disk cache.
+  /// [maxAttempts] is the total tries per download (network/5xx retries and
+  /// at most one [urlRefresher] call each).
   /// Must be called before the first [ResponsiveImageView] is built.
   /// [skeletonBaseColor]/[skeletonHighlightColor] style the default skeleton
   /// (per-widget override via [placeholder]).
@@ -61,6 +71,7 @@ class ResponsiveImageView extends StatefulWidget {
     int maxDownloads = 6,
     int maxProcessing = 2,
     int maxDownloadBytes = 30 * 1024 * 1024,
+    int maxAttempts = 3,
     int maxPixels = 100 * 1000 * 1000,
     int quality = 80,
     Duration cacheMaxAge = const Duration(days: 30),
@@ -72,6 +83,7 @@ class ResponsiveImageView extends StatefulWidget {
     maxDownloads: maxDownloads,
     maxProcessing: maxProcessing,
     maxDownloadBytes: maxDownloadBytes,
+    maxAttempts: maxAttempts,
     maxPixels: maxPixels,
     quality: quality,
     cacheMaxAge: cacheMaxAge,
@@ -94,10 +106,27 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   String? _loadedFor;
   File? _file;
   File? _preview;
+  String? _previewVariant;
+  Size? _lastScreenPx;
   bool _svg = false;
   _SvgLoader? _svgLoader;
   String? _xsId;
   Object? _error;
+
+  @override
+  void didUpdateWidget(covariant ResponsiveImageView old) {
+    super.didUpdateWidget(old);
+    if (old.url != widget.url ||
+        old.cacheKey != widget.cacheKey ||
+        old.showOriginalImage != widget.showOriginalImage) {
+      _loadedFor = null;
+      // Known-size widgets re-resolve inside the next build; for measured
+      // sizes onSize only fires on size change, so re-trigger with the
+      // tier/screenPx captured the last time it ran.
+      final tier = _tier, px = _lastScreenPx;
+      if (tier != null && px != null) _ensureLoaded(tier, px);
+    }
+  }
 
   @override
   void dispose() {
@@ -108,7 +137,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
 
   void _ensureLoaded(int tier, Size screenPx) {
     final source = widget.cacheKey ?? widget.url;
-    final id = '$source|t$tier';
+    final original = widget.showOriginalImage;
+    final id = original ? '$source|org' : '$source|t$tier';
     if (_loadedFor == id) return;
     _loadedFor = id;
     _request?.cancel();
@@ -116,24 +146,40 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     if (_sourceId != source) {
       _file = null;
       _preview = null;
+      _previewVariant = null;
       _svg = false;
       _svgLoader = null;
     }
     _sourceId = source;
     _tier = tier;
+    _lastScreenPx = screenPx;
     _error = null;
     final hub = ImageHub.instance;
-    final cached = hub.peek(widget.url, tier, cacheKey: widget.cacheKey);
+    final cached = original
+        ? hub.peekOriginal(widget.url, cacheKey: widget.cacheKey)
+        : hub.peek(widget.url, tier, cacheKey: widget.cacheKey);
     if (cached != null) {
       _file = cached.file;
       _svg = cached.svg;
       return;
     }
-    _preview ??= hub.peekXs(widget.url, cacheKey: widget.cacheKey);
+    if (_preview == null) {
+      if (original) {
+        final pv = hub.peekBestPreview(widget.url, cacheKey: widget.cacheKey);
+        _preview = pv?.file;
+        _previewVariant = pv?.variant;
+      } else {
+        _preview = hub.peekXs(widget.url, cacheKey: widget.cacheKey);
+        _previewVariant = _preview == null ? null : 'xs';
+      }
+    }
     _xsId = '${ImageHub.keyOf(widget.url, widget.cacheKey)}_xs';
     _sub ??= hub.events.listen((e) {
       if (mounted && _file == null && e.$1 == _xsId) {
-        setState(() => _preview = e.$2);
+        setState(() {
+          _preview = e.$2;
+          _previewVariant = 'xs';
+        });
       }
     });
     final req = _request = ImageHub.instance.request(
@@ -142,6 +188,7 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       screenPx,
       cacheKey: widget.cacheKey,
       refresher: widget.urlRefresher,
+      original: original,
     );
     req.future.then(
       (r) {
@@ -167,6 +214,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final url = widget.url, cacheKey = widget.cacheKey, svg = _svg;
     if (svg) {
       await hub.invalidateSvg(url, cacheKey: cacheKey);
+    } else if (widget.showOriginalImage) {
+      await hub.invalidateOrg(url, cacheKey: cacheKey);
     } else {
       await hub.invalidate(url, tier, cacheKey: cacheKey);
     }
@@ -203,11 +252,14 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final forId = _loadedFor;
     final tier = _tier!;
     final url = widget.url, cacheKey = widget.cacheKey, svg = _svg;
+    final original = widget.showOriginalImage;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted || _loadedFor != forId) return;
       final hub = ImageHub.instance;
       if (svg) {
         await hub.invalidateSvg(url, cacheKey: cacheKey);
+      } else if (original) {
+        await hub.invalidateOrg(url, cacheKey: cacheKey);
       } else {
         await hub.invalidate(url, tier, cacheKey: cacheKey);
       }
@@ -221,26 +273,42 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     });
   }
 
+  /// Keeps finite values >= 0 and +infinity (expand-to-fill); drops NaN,
+  /// -infinity and negatives which would crash SizedBox.
+  static double? _layoutDim(double? v) => v == null || (v.isFinite && v >= 0)
+      ? v
+      : (v == double.infinity ? v : null);
+
   @override
   Widget build(BuildContext context) {
     final screen = MediaQuery.sizeOf(context);
     final dpr = MediaQuery.devicePixelRatioOf(context);
-    final w = widget.width, h = widget.height;
+    final w = _layoutDim(widget.width), h = _layoutDim(widget.height);
+    // Only finite dimensions count as known for tier resolution:
+    // double.infinity ("fill parent") is measured after layout instead of
+    // being resolved as an infinitely large image.
+    final mw = w != null && w.isFinite ? w : null;
+    final mh = h != null && h.isFinite ? h : null;
     final screenPx = screen * dpr;
     // Known size: resolve right here in build (no extra frame, and a cached
     // image shows immediately). Unknown size: measure after layout.
-    if (w != null && h != null) {
+    if (mw != null && mh != null) {
       _ensureLoaded(
-        ImageHub.instance.scheme.resolve(Size(w, h), screen),
+        ImageHub.instance.scheme.resolve(Size(mw, mh), screen),
         screenPx,
       );
     }
     return _MeasuredSize(
-      enabled: w == null || h == null,
-      onSize: (size) {
+      enabled: mw == null || mh == null,
+      onSize: (size, biggest) {
         if (!mounted) return;
-        final realW = w ?? (size.width > 0 ? size.width : screen.width);
-        final realH = h ?? (size.height > 0 ? size.height : screen.height);
+        // Painted size is authoritative when non-zero; under loose
+        // constraints the skeleton paints at 0x0, so fall back to the
+        // offered constraint space, then to the full screen.
+        double pick(double? known, double painted, double cap, double full) =>
+            known ?? (painted > 0 ? painted : (cap.isFinite ? cap : full));
+        final realW = pick(mw, size.width, biggest.width, screen.width);
+        final realH = pick(mh, size.height, biggest.height, screen.height);
         // Runs outside build, so state changes must trigger a rebuild.
         setState(
           () => _ensureLoaded(
@@ -301,7 +369,9 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               height: h,
               fit: widget.fit,
               alignment: widget.alignment,
-              cacheWidth: ((w ?? screen.width) * dpr).round(),
+              cacheWidth: (mw ?? screen.width) * dpr > 0
+                  ? ((mw ?? screen.width) * dpr).round()
+                  : null,
               gaplessPlayback: true,
               frameBuilder: (ctx, child, frame, _) {
                 // ignore: avoid_print
@@ -327,14 +397,27 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               alignment: widget.alignment,
               gaplessPlayback: true,
               errorBuilder: (_, _, _) {
-                // Broken/deleted preview: drop it and fall back to skeleton.
-                unawaited(
-                  ImageHub.instance.invalidateXs(
-                    widget.url,
-                    cacheKey: widget.cacheKey,
-                  ),
-                );
-                if (mounted) setState(() => _preview = null);
+                // Broken/deleted preview: drop the file it came from and
+                // fall back to skeleton — post-frame, since errorBuilder
+                // runs inside build.
+                final pv = _previewVariant;
+                final url = widget.url, cacheKey = widget.cacheKey;
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  if (pv != null) {
+                    unawaited(
+                      ImageHub.instance.invalidateVariant(
+                        url,
+                        pv,
+                        cacheKey: cacheKey,
+                      ),
+                    );
+                  }
+                  setState(() {
+                    _preview = null;
+                    _previewVariant = null;
+                  });
+                });
                 return const SizedBox.shrink();
               },
             );
@@ -387,7 +470,7 @@ class _MeasuredSize extends StatefulWidget {
     required this.child,
   });
   final bool enabled;
-  final ValueChanged<Size> onSize;
+  final void Function(Size painted, Size biggest) onSize;
   final Widget child;
 
   @override
@@ -396,6 +479,7 @@ class _MeasuredSize extends StatefulWidget {
 
 class _MeasuredSizeState extends State<_MeasuredSize> {
   Size? _last;
+  Size? _lastBiggest;
 
   @override
   Widget build(BuildContext context) {
@@ -403,10 +487,13 @@ class _MeasuredSizeState extends State<_MeasuredSize> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final box = context.findRenderObject();
-      final size = box is RenderBox && box.hasSize ? box.size : null;
-      if (size != null && size != _last) {
+      if (box is! RenderBox || !box.hasSize) return;
+      final size = box.size;
+      final biggest = box.constraints.biggest;
+      if (size != _last || biggest != _lastBiggest) {
         _last = size;
-        widget.onSize(size);
+        _lastBiggest = biggest;
+        widget.onSize(size, biggest);
       }
     });
     return widget.child;

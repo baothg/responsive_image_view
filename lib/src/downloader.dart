@@ -64,6 +64,7 @@ class Downloader {
   }) async {
     Object? last;
     var current = url;
+    var refreshed = false;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         await _fetch(current, target).timeout(perDownloadTimeout);
@@ -75,6 +76,12 @@ class Downloader {
           throw ImageNotFoundException(code!, url: current);
         }
         if (code != null && _authExpired(code)) {
+          // A freshly minted url that still returns 401/403 means the
+          // refresher cannot help (e.g. some storages answer 403 for
+          // missing objects) — fail fast instead of calling it again on
+          // every retry.
+          if (refreshed) rethrow;
+          refreshed = true;
           final fresh = refresher == null ? null : await refresher(url);
           if (fresh == null) rethrow;
           current = fresh;

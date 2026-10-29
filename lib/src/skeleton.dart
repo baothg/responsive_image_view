@@ -1,4 +1,42 @@
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
+
+/// Standalone vsync for the shared shimmer driver — a skeleton's own
+/// SingleTickerProvider is not needed when the controller is shared.
+class _SharedTicker extends TickerProvider {
+  const _SharedTicker();
+
+  @override
+  Ticker createTicker(TickerCallback onTick) => Ticker(onTick);
+}
+
+/// One ticker for every default-period skeleton instead of one
+/// AnimationController per widget — dozens of visible skeletons in a list
+/// would otherwise keep a ticker each. Created lazily on first use and
+/// disposed when the last skeleton detaches; all users share the same
+/// sweep phase, like a single `shimmer` ancestor.
+class _SharedShimmer {
+  _SharedShimmer._();
+
+  static AnimationController? _controller;
+  static int _users = 0;
+
+  static Animation<double> acquire(Duration period) {
+    _users++;
+    return _controller ??= AnimationController(
+        vsync: const _SharedTicker(),
+        duration: period,
+      )
+      ..repeat();
+  }
+
+  static void release() {
+    if (_users > 0 && --_users == 0) {
+      _controller?.dispose();
+      _controller = null;
+    }
+  }
+}
 
 /// Default loading view: a `shimmer`-style gradient sweep
 /// (base -> highlight -> base sliding diagonally), so it reads as "loading"
@@ -8,8 +46,11 @@ class ResponsiveImageSkeleton extends StatefulWidget {
     super.key,
     this.baseColor = const Color(0xFFBDBDBD),
     this.highlightColor = const Color(0xFFFAFAFA),
-    this.period = const Duration(milliseconds: 1500),
+    this.period = defaultPeriod,
   });
+
+  /// Skeletons using this period share a single animation ticker.
+  static const defaultPeriod = Duration(milliseconds: 1500);
 
   final Color baseColor;
   final Color highlightColor;
@@ -22,12 +63,49 @@ class ResponsiveImageSkeleton extends StatefulWidget {
 
 class _ResponsiveImageSkeletonState extends State<ResponsiveImageSkeleton>
     with SingleTickerProviderStateMixin {
-  late final _c = AnimationController(vsync: this, duration: widget.period)
-    ..repeat();
+  Animation<double> _t = const AlwaysStoppedAnimation<double>(0);
+  AnimationController? _own;
+  bool _shared = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _attach(widget.period);
+  }
+
+  void _attach(Duration period) {
+    if (period == ResponsiveImageSkeleton.defaultPeriod) {
+      _shared = true;
+      _t = _SharedShimmer.acquire(period);
+    } else {
+      _shared = false;
+      _own = AnimationController(vsync: this, duration: period)..repeat();
+      _t = _own!;
+    }
+  }
+
+  void _detach() {
+    if (_shared) {
+      _SharedShimmer.release();
+      _shared = false;
+    } else {
+      _own?.dispose();
+      _own = null;
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant ResponsiveImageSkeleton old) {
+    super.didUpdateWidget(old);
+    if (old.period != widget.period) {
+      _detach();
+      _attach(widget.period);
+    }
+  }
 
   @override
   void dispose() {
-    _c.dispose();
+    _detach();
     super.dispose();
   }
 
@@ -37,7 +115,10 @@ class _ResponsiveImageSkeletonState extends State<ResponsiveImageSkeleton>
     // out infinite constraints); a tight parent overrides it anyway.
     return CustomPaint(
       size: Size.zero,
-      painter: _SkeletonPainter(_c, widget.baseColor, widget.highlightColor),
+      // Repaints every tick — keep it in its own layer so it does not
+      // invalidate neighboring paint work.
+      willChange: true,
+      painter: _SkeletonPainter(_t, widget.baseColor, widget.highlightColor),
     );
   }
 }
