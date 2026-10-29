@@ -49,7 +49,9 @@ class ResponsiveImageView extends StatefulWidget {
   final Future<String?> Function(String expiredUrl)? urlRefresher;
 
   /// Downloads and displays the untouched original file instead of a
-  /// resized bucket. Progressive display still applies: skeleton, then the
+  /// resized bucket, decoded at native resolution (sharp at any zoom level
+  /// — e.g. inside InteractiveViewer; memory is still bounded by
+  /// [maxPixels]). Progressive display still applies: skeleton, then the
   /// best cached preview (largest bucket variant, else XS), then the
   /// original. The original is cached as a single file — no bucket variants
   /// are produced — and can serve as the resize source for later requests.
@@ -369,7 +371,11 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               height: h,
               fit: widget.fit,
               alignment: widget.alignment,
-              cacheWidth: (mw ?? screen.width) * dpr > 0
+              // Original mode decodes at native resolution (zoom viewers);
+              // bucketed images are still capped at display size for memory.
+              cacheWidth: widget.showOriginalImage
+                  ? null
+                  : (mw ?? screen.width) * dpr > 0
                   ? ((mw ?? screen.width) * dpr).round()
                   : null,
               gaplessPlayback: true,
