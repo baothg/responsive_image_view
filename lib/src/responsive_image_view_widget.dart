@@ -112,8 +112,16 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   Size? _lastScreenPx;
   bool _svg = false;
   _SvgLoader? _svgLoader;
-  String? _xsId;
+  String? _keyPrefix;
   Object? _error;
+
+  /// Preview quality rank: xs < b0 < b1 < ... — a produced variant only
+  /// replaces the current preview when it is larger.
+  static int _variantRank(String? v) {
+    if (v == null) return -2;
+    if (v == 'xs') return -1;
+    return v.startsWith('b') ? (int.tryParse(v.substring(1)) ?? -2) : -2;
+  }
 
   @override
   void didUpdateWidget(covariant ResponsiveImageView old) {
@@ -166,23 +174,24 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       return;
     }
     if (_preview == null) {
-      if (original) {
-        final pv = hub.peekBestPreview(widget.url, cacheKey: widget.cacheKey);
-        _preview = pv?.file;
-        _previewVariant = pv?.variant;
-      } else {
-        _preview = hub.peekXs(widget.url, cacheKey: widget.cacheKey);
-        _previewVariant = _preview == null ? null : 'xs';
-      }
+      // Largest already-cached variant (bN, else xs) as the preview.
+      final pv = hub.peekBestPreview(widget.url, cacheKey: widget.cacheKey);
+      _preview = pv?.file;
+      _previewVariant = pv?.variant;
     }
-    _xsId = '${ImageHub.keyOf(widget.url, widget.cacheKey)}_xs';
+    _keyPrefix = '${ImageHub.keyOf(widget.url, widget.cacheKey)}_';
     _sub ??= hub.events.listen((e) {
-      if (mounted && _file == null && e.$1 == _xsId) {
-        setState(() {
-          _preview = e.$2;
-          _previewVariant = 'xs';
-        });
-      }
+      final prefix = _keyPrefix;
+      if (!mounted || _file != null || prefix == null) return;
+      if (!e.$1.startsWith(prefix)) return;
+      final variant = e.$1.substring(prefix.length);
+      // Raster previews only (xs, bN) — never downgrade the current one.
+      if (variant != 'xs' && !variant.startsWith('b')) return;
+      if (_variantRank(variant) <= _variantRank(_previewVariant)) return;
+      setState(() {
+        _preview = e.$2;
+        _previewVariant = variant;
+      });
     });
     final req = _request = ImageHub.instance.request(
       widget.url,
@@ -401,6 +410,9 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               height: h,
               fit: widget.fit,
               alignment: widget.alignment,
+              cacheWidth: (mw ?? screen.width) * dpr > 0
+                  ? ((mw ?? screen.width) * dpr).round()
+                  : null,
               gaplessPlayback: true,
               errorBuilder: (_, _, _) {
                 // Broken/deleted preview: drop the file it came from and

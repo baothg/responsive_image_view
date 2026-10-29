@@ -1176,4 +1176,47 @@ void main() {
     expect(got!.path, contains('_org'));
     expect(t.takeException(), isNull);
   });
+
+  testWidgets(
+    'preview falls back to the largest cached variant in bucket mode too',
+    (t) async {
+      final dir = Directory.systemTemp.createTempSync('ri_pv');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final cache = DiskCache(directory: dir);
+      final key = DiskCache.hash('pv-key');
+      final png = img.encodePng(img.Image(width: 8, height: 8));
+      // Only b2 cached; the b0 the widget needs will fail to download, so
+      // the preview must stay on the largest available file.
+      await t.runAsync(() => cache.put(key, 'b2', png));
+      late ImageHub hub;
+      await t.runAsync(() async {
+        hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      ImageHub.instance = hub;
+      await t.pumpWidget(
+        const Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/p.jpg',
+              cacheKey: 'pv-key',
+              width: 72,
+              height: 72,
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      final image = t.widget<Image>(find.byType(Image));
+      final provider = image.image;
+      final file =
+          (provider is ResizeImage ? provider.imageProvider : provider)
+              as FileImage;
+      expect(file.file.path, endsWith('_b2.img'));
+      expect(t.takeException(), isNull);
+    },
+  );
 }
