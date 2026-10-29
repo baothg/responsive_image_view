@@ -237,13 +237,14 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       // Lazy: the resolver only runs on a cache miss.
       if (_resolving == null) {
         late Future<String?> fut;
-        fut = _resolving = Future<String?>.value(widget.urlResolver!()).then((
-          u,
-        ) {
-          // Ignore a resolution that finished after the url/source moved on.
-          if (identical(_resolving, fut)) _resolvedUrl = u;
-          return u;
-        });
+        // Future.sync (not .value): a synchronously-throwing resolver must
+        // surface through onError -> errorBuilder, not crash the build.
+        fut = _resolving = Future<String?>.sync(() => widget.urlResolver!())
+            .then((u) {
+              // Ignore a resolution that finished after the url/source moved on.
+              if (identical(_resolving, fut)) _resolvedUrl = u;
+              return u;
+            });
       }
       _resolving!.then(
         (u) {

@@ -1339,4 +1339,44 @@ void main() {
     expect(errors, greaterThan(0));
     expect(t.takeException(), isNull);
   });
+
+  testWidgets('lazy ctor: synchronously-throwing resolver -> errorBuilder', (
+    t,
+  ) async {
+    ImageHub.instance = ImageHub(
+      cache: DiskCache(
+        directory: Directory.systemTemp.createTempSync('ri_lz4')
+          ..deleteSync(recursive: true),
+      ),
+      downloader: _FailingDownloader(),
+    );
+    var errors = 0;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView.lazy(
+              cacheKey: 'lazy-throw',
+              urlResolver: () =>
+                  throw const FormatException('Unexpected character'),
+              width: 72,
+              height: 72,
+              errorBuilder: (_, e, retry) {
+                errors++;
+                return const Text('err', textDirection: TextDirection.ltr);
+              },
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await t.pump();
+    });
+    expect(errors, greaterThan(0));
+    expect(t.takeException(), isNull);
+  });
 }
