@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/widgets.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:responsive_image_view/responsive_image_view.dart';
 import 'package:responsive_image_view/src/disk_cache.dart';
@@ -51,6 +53,26 @@ class _TinyDownloader extends Downloader {
   }
 }
 
+const _svgBody =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+    '<rect width="10" height="10" fill="#f00"/></svg>';
+
+/// Writes raw bytes (e.g. SVG markup) as the download result.
+class _RawDownloader extends Downloader {
+  _RawDownloader(this.body);
+  final List<int> body;
+  int calls = 0;
+  @override
+  Future<void> download(
+    String url,
+    File target, {
+    UrlRefresher? refresher,
+  }) async {
+    calls++;
+    await target.writeAsBytes(body);
+  }
+}
+
 class _FailingDownloader extends Downloader {
   static int calls = 0;
   @override
@@ -88,6 +110,15 @@ class _FakeResizer extends Resizer {
 Future<HttpServer> _serve(void Function(HttpResponse r) handler) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((req) => handler(req.response));
+  return server;
+}
+
+/// Like [_serve] but the handler also sees the request (path-aware).
+Future<HttpServer> _serveReq(
+  void Function(HttpRequest req, HttpResponse r) handler,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((req) => handler(req, req.response));
   return server;
 }
 
@@ -219,6 +250,108 @@ void main() {
       await server.close();
     });
 
+    for (final code in [404, 410]) {
+      test('HTTP $code fails fast as ImageNotFoundException', () async {
+        var hits = 0;
+        var refresherCalls = 0;
+        final server = await _serve((r) {
+          hits++;
+          r.statusCode = code;
+          r.close();
+        });
+        final url = 'http://127.0.0.1:${server.port}/missing';
+        final target = File('${dir.path}/t$code');
+        await expectLater(
+          Downloader(retryDelay: Duration.zero).download(
+            url,
+            target,
+            refresher: (_) async {
+              refresherCalls++;
+              return url;
+            },
+          ),
+          throwsA(
+            isA<ImageNotFoundException>()
+                .having((e) => e.statusCode, 'statusCode', code)
+                .having((e) => e.url, 'url', url),
+          ),
+        );
+        expect(hits, 1); // no retry, definitive status
+        expect(refresherCalls, 0); // refresher is for auth expiry only
+        await server.close(force: true);
+      });
+    }
+
+    test('401/403 ask the refresher and retry with the new url', () async {
+      var hits = 0;
+      var refresherCalls = 0;
+      final png = img.encodePng(img.Image(width: 2, height: 2));
+      late HttpServer server;
+      server = await _serveReq((req, r) {
+        hits++;
+        if (req.uri.path == '/fresh') {
+          r.add(png);
+        } else {
+          r.statusCode = 401;
+        }
+        r.close();
+      });
+      final base = 'http://127.0.0.1:${server.port}';
+      final target = File('${dir.path}/auth');
+      await Downloader(retryDelay: Duration.zero).download(
+        '$base/expired',
+        target,
+        refresher: (expired) async {
+          refresherCalls++;
+          expect(expired, '$base/expired');
+          return '$base/fresh';
+        },
+      );
+      expect(hits, 2);
+      expect(refresherCalls, 1);
+      expect(target.readAsBytesSync(), png);
+      await server.close(force: true);
+    });
+
+    test('401 without a refresher rethrows the original error', () async {
+      final server = await _serve((r) {
+        r.statusCode = 403;
+        r.close();
+      });
+      await expectLater(
+        Downloader(retryDelay: Duration.zero).download(
+          'http://127.0.0.1:${server.port}/x',
+          File('${dir.path}/nf'),
+        ),
+        throwsA(
+          isA<DownloadException>()
+              .having((e) => e.statusCode, 'statusCode', 403)
+              .having((e) => e is ImageNotFoundException, 'notFound', isFalse),
+        ),
+      );
+      await server.close(force: true);
+    });
+
+    test('a refreshed url that is itself missing fails as not-found', () async {
+      var hits = 0;
+      final server = await _serveReq((req, r) {
+        hits++;
+        r.statusCode = req.uri.path == '/a' ? 403 : 404;
+        r.close();
+      });
+      final base = 'http://127.0.0.1:${server.port}';
+      await expectLater(
+        Downloader(retryDelay: Duration.zero).download(
+          '$base/a',
+          File('${dir.path}/m'),
+          refresher: (_) async => '$base/b',
+        ),
+        throwsA(isA<ImageNotFoundException>()),
+      );
+      expect(hits, 2);
+      await server.close(force: true);
+    });
+
     test('a slow-drip stream hits the overall download deadline', () async {
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       var running = true;
@@ -339,10 +472,10 @@ void main() {
             .request('u', 1, const Size(1200, 2400), cacheKey: 'k')
             .future;
         expect(dl.calls, 1);
-        expect(f.existsSync(), true);
+        expect(f.file.existsSync(), true);
         await hub.invalidate('u', 1, cacheKey: 'k');
         expect(hub.peek('u', 1, cacheKey: 'k'), isNull);
-        expect(f.existsSync(), false);
+        expect(f.file.existsSync(), false);
       },
     );
 
@@ -442,6 +575,72 @@ void main() {
       expect(rs.sources.length, 2);
       await hub.request('u', 1, px, cacheKey: 'n').future; // M already cached
       // now request another image with only L cached -> S reuses L
+    });
+
+    test(
+      'svg bypasses raster pipeline: one cached file, no variants',
+      () async {
+        final cache = DiskCache(directory: dir);
+        final dl = _RawDownloader(utf8.encode(_svgBody));
+        final rs = _FakeResizer();
+        final hub = ImageHub(cache: cache, downloader: dl, resizer: rs);
+        const px = Size(1200, 2400);
+        final r = await hub.request('u', 0, px, cacheKey: 's').future;
+        expect(r.svg, isTrue);
+        expect(r.file.existsSync(), isTrue);
+        expect(r.file.path, endsWith('_svg.img'));
+        expect(rs.sizes, isEmpty); // never enters the raster resizer
+        final key = DiskCache.hash('s');
+        expect(await cache.get(key, 'xs'), isNull);
+        expect(await cache.get(key, 'b0'), isNull);
+        // peek sees the svg file for any tier.
+        final hit = hub.peek('u', 2, cacheKey: 's');
+        expect(hit!.svg, isTrue);
+        expect(hit.file.path, r.file.path);
+        // Another tier reuses the svg file — no second download.
+        final r2 = await hub.request('u', 2, px, cacheKey: 's').future;
+        expect(r2.svg, isTrue);
+        expect(r2.file.path, r.file.path);
+        expect(dl.calls, 1);
+        // Dropping it makes the next request download again.
+        await hub.invalidateSvg('u', cacheKey: 's');
+        expect(hub.peek('u', 0, cacheKey: 's'), isNull);
+        await hub.request('u', 0, px, cacheKey: 's').future;
+        expect(dl.calls, 2);
+      },
+    );
+
+    test('xml with an <svg> root (after <?xml>) is detected', () async {
+      final dl = _RawDownloader(
+        utf8.encode('<?xml version="1.0"?>\n$_svgBody'),
+      );
+      final hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      final r = await hub
+          .request('u', 0, const Size(1200, 2400), cacheKey: 'x')
+          .future;
+      expect(r.svg, isTrue);
+    });
+
+    test('non-svg xml/text is not misdetected', () async {
+      for (final body in [
+        '<?xml version="1.0"?><feed title="svg-icon"/>',
+        '<rss version="2.0"></rss>',
+        'plain text with svg word inside',
+      ]) {
+        final hub = ImageHub(
+          cache: DiskCache(directory: dir),
+          downloader: _RawDownloader(utf8.encode(body)),
+          resizer: _FakeResizer(),
+        );
+        final r = await hub
+            .request('u', 0, const Size(1200, 2400), cacheKey: body)
+            .future;
+        expect(r.svg, isFalse, reason: body);
+      }
     });
 
     test('cancelled queued job is dropped', () async {
@@ -621,5 +820,98 @@ void main() {
     await t.pump();
     expect(find.byType(ResponsiveImageSkeleton), findsNothing);
     expect(calls, 0);
+  });
+
+  testWidgets('svg renders via SvgPicture and fires onLoaded', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_svg');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('svg-key');
+    await t.runAsync(() => cache.put(key, 'svg', utf8.encode(_svgBody)));
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    var calls = 0;
+    File? got;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/s.svg',
+              cacheKey: 'svg-key',
+              width: 72,
+              height: 72,
+              onLoaded: (f) {
+                calls++;
+                got = f;
+              },
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await t.pump();
+    });
+    await t.pump();
+    expect(find.byType(SvgPicture), findsOneWidget);
+    expect(find.byType(ResponsiveImageSkeleton), findsNothing);
+    expect(calls, 1);
+    expect(got!.path, contains('_svg'));
+  });
+
+  testWidgets('malformed svg surfaces through errorBuilder', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_svgbad');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final cache = DiskCache(directory: dir);
+    final key = DiskCache.hash('bad-svg');
+    await t.runAsync(
+      () => cache.put(
+        key,
+        'svg',
+        utf8.encode('<svg xmlns="http://www.w3.org/2000/svg"><rect'),
+      ),
+    );
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    });
+    ImageHub.instance = hub;
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/b.svg',
+              cacheKey: 'bad-svg',
+              width: 72,
+              height: 72,
+              errorBuilder: (ctx, e, retry) => const Text('err'),
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await t.pump();
+      // The file error invalidates + re-downloads; the request then fails
+      // (downloader always throws) and the final error lands in errorBuilder.
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await t.pump();
+    });
+    await t.pump();
+    expect(find.text('err'), findsOneWidget);
+    expect(t.takeException(), isNull);
   });
 }

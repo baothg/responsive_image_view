@@ -83,6 +83,13 @@ class DiskCache {
     }
   }
 
+  /// Atomically adopts [file] as a variant (rename within the same
+  /// directory — no extra read/copy, useful for large files).
+  Future<File> adopt(String key, String variant, File file) async {
+    final f = await fileFor(key, variant);
+    return file.rename(f.path);
+  }
+
   /// Atomically stores [bytes].
   Future<File> put(String key, String variant, List<int> bytes) async {
     final f = await fileFor(key, variant);

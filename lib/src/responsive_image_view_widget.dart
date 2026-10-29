@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/widgets.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import 'image_hub.dart';
 import 'skeleton.dart';
@@ -35,12 +36,15 @@ class ResponsiveImageView extends StatefulWidget {
   errorBuilder;
 
   /// Called once per (url, size) after the target image's first frame has
-  /// been decoded — including when served from cache. Not called for the
-  /// XS preview, and not again on rebuilds. Useful for e.g. deleting a
-  /// local temp photo only after its uploaded network copy renders.
+  /// been decoded — including when served from cache. For SVG it fires once
+  /// the file has been parsed/compiled for display. Not called for the XS
+  /// preview, and not again on rebuilds. Useful for e.g. deleting a local
+  /// temp photo only after its uploaded network copy renders.
   final void Function(File file)? onLoaded;
 
-  /// Called when the url looks expired (401/403/404/410) to obtain a fresh one.
+  /// Called when the url is rejected for auth/expiry (401/403) to obtain a
+  /// fresh one. Missing resources (404/410) never reach this callback —
+  /// they surface as [ImageNotFoundException] in [errorBuilder].
   final Future<String?> Function(String expiredUrl)? urlRefresher;
 
   /// Overrides the default cache identity (url without signing query params).
@@ -90,6 +94,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   String? _loadedFor;
   File? _file;
   File? _preview;
+  bool _svg = false;
+  _SvgLoader? _svgLoader;
   String? _xsId;
   Object? _error;
 
@@ -110,6 +116,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     if (_sourceId != source) {
       _file = null;
       _preview = null;
+      _svg = false;
+      _svgLoader = null;
     }
     _sourceId = source;
     _tier = tier;
@@ -117,7 +125,8 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final hub = ImageHub.instance;
     final cached = hub.peek(widget.url, tier, cacheKey: widget.cacheKey);
     if (cached != null) {
-      _file = cached;
+      _file = cached.file;
+      _svg = cached.svg;
       return;
     }
     _preview ??= hub.peekXs(widget.url, cacheKey: widget.cacheKey);
@@ -135,8 +144,13 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       refresher: widget.urlRefresher,
     );
     req.future.then(
-      (f) {
-        if (mounted && _request == req) setState(() => _file = f);
+      (r) {
+        if (mounted && _request == req) {
+          setState(() {
+            _file = r.file;
+            _svg = r.svg;
+          });
+        }
       },
       onError: (Object e) {
         if (mounted && _request == req && !isCancelled(e)) {
@@ -149,14 +163,18 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   Future<void> _retry() async {
     final tier = _tier;
     if (!mounted || tier == null) return;
-    await ImageHub.instance.invalidate(
-      widget.url,
-      tier,
-      cacheKey: widget.cacheKey,
-    );
+    final hub = ImageHub.instance;
+    final url = widget.url, cacheKey = widget.cacheKey, svg = _svg;
+    if (svg) {
+      await hub.invalidateSvg(url, cacheKey: cacheKey);
+    } else {
+      await hub.invalidate(url, tier, cacheKey: cacheKey);
+    }
     if (!mounted) return;
     setState(() {
       _file = null;
+      _svg = false;
+      _svgLoader = null;
       _error = null;
       _retriedFor = null;
       _loadedFor = null;
@@ -180,16 +198,24 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   void _onFileError() {
     if (_retriedFor == _loadedFor) return;
     _retriedFor = _loadedFor;
+    // Capture the file's identity now — by the time the post-frame callback
+    // runs, widget.url/_svg may already describe a different image.
+    final forId = _loadedFor;
     final tier = _tier!;
+    final url = widget.url, cacheKey = widget.cacheKey, svg = _svg;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await ImageHub.instance.invalidate(
-        widget.url,
-        tier,
-        cacheKey: widget.cacheKey,
-      );
-      if (!mounted) return;
+      if (!mounted || _loadedFor != forId) return;
+      final hub = ImageHub.instance;
+      if (svg) {
+        await hub.invalidateSvg(url, cacheKey: cacheKey);
+      } else {
+        await hub.invalidate(url, tier, cacheKey: cacheKey);
+      }
+      if (!mounted || _loadedFor != forId) return;
       setState(() {
         _file = null;
+        _svg = false;
+        _svgLoader = null;
         _loadedFor = null;
       });
     });
@@ -227,6 +253,47 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
         width: w,
         height: h,
         child: () {
+          if (_file != null && _svg) {
+            final file = _file!;
+            // Resolve the theme in build (dependOn* is illegal async) and
+            // bake it into the loader, so our pre-load and SvgPicture's own
+            // loadBytes share one SvgCacheKey.
+            final theme = DefaultSvgTheme.of(context)?.theme;
+            var loader = _svgLoader;
+            if (loader == null || loader.theme != theme) {
+              loader = _svgLoader = _SvgLoader(file, theme: theme);
+            }
+            // loadBytes compiles the SVG and is memoized in svg.cache by
+            // loader key, so SvgPicture's own load hits the same entry:
+            // this only pre-fires the completion signal for onLoaded.
+            // Future() guards against loadBytes throwing synchronously
+            // (Cache.putIfAbsent invokes the loader inline).
+            unawaited(
+              Future(() => loader!.loadBytes(null))
+                  .then((_) {
+                    if (mounted && _file == file && _svg) _notifyLoaded();
+                  })
+                  .catchError((_) {}),
+            );
+            return SvgPicture(
+              loader,
+              width: w,
+              height: h,
+              fit: widget.fit ?? BoxFit.contain,
+              alignment: widget.alignment,
+              placeholderBuilder: (ctx) =>
+                  widget.placeholder?.call(ctx) ??
+                  ResponsiveImageSkeleton(
+                    baseColor: ImageHub.instance.skeletonBaseColor,
+                    highlightColor: ImageHub.instance.skeletonHighlightColor,
+                  ),
+              errorBuilder: (ctx, e, st) {
+                _onFileError();
+                return widget.errorBuilder?.call(ctx, e, _retry) ??
+                    const SizedBox.shrink();
+              },
+            );
+          }
           if (_file != null) {
             return Image.file(
               _file!,
@@ -281,6 +348,36 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       ),
     );
   }
+}
+
+/// A [SvgFileLoader] whose cache identity also covers the file's content
+/// (size + mtime): a re-downloaded or replaced file under the same path
+/// compiles fresh instead of reusing a stale entry — flutter_svg's [Cache]
+/// keeps a failed load in its pending map forever.
+class _SvgLoader extends SvgFileLoader {
+  _SvgLoader(super.file, {super.theme}) : _stamp = _stampOf(file);
+
+  final int _stamp;
+
+  static int _stampOf(File f) {
+    try {
+      final s = f.statSync();
+      return Object.hash(s.size, s.modified.microsecondsSinceEpoch);
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  @override
+  int get hashCode => Object.hash(file, theme, colorMapper, _stamp);
+
+  @override
+  bool operator ==(Object other) =>
+      other is _SvgLoader &&
+      other.file == file &&
+      other.theme == theme &&
+      other.colorMapper == colorMapper &&
+      other._stamp == _stamp;
 }
 
 class _MeasuredSize extends StatefulWidget {

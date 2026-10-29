@@ -10,7 +10,7 @@ import 'size_bucket.dart';
 /// Handle returned to a widget; call [cancel] on dispose.
 class ImageRequest {
   ImageRequest._(this.future, this._cancel);
-  final Future<File> future;
+  final Future<({File file, bool svg})> future;
   final void Function() _cancel;
   void cancel() => _cancel();
 }
@@ -22,7 +22,7 @@ class _Job {
   final int tier;
   final Size screenPx;
   final UrlRefresher? refresher;
-  final completer = Completer<File>()..future.ignore();
+  final completer = Completer<({File file, bool svg})>()..future.ignore();
   int listeners = 0;
   bool started = false;
 }
@@ -135,7 +135,7 @@ class ImageHub {
   final _runningKeys = <String>{};
   int _running = 0;
   bool _used = false;
-  final _known = <String, File>{};
+  final _known = <String, (File, bool)>{};
   final _failures = <String, (DateTime, Object)>{};
   final _events = StreamController<(String, File)>.broadcast();
 
@@ -150,15 +150,16 @@ class ImageHub {
       for (final f in await cache.cleanup()) {
         final name = f.uri.pathSegments.last;
         if (name.endsWith('.img')) {
-          _remember(name.substring(0, name.length - 4), f);
+          final id = name.substring(0, name.length - 4);
+          _remember(id, f, svg: id.endsWith('_svg'));
         }
       }
     } catch (_) {}
   }
 
-  void _remember(String id, File f) {
+  void _remember(String id, File f, {bool svg = false}) {
     _known.remove(id);
-    _known[id] = f;
+    _known[id] = (f, svg);
     if (_known.length > _knownCapacity) _known.remove(_known.keys.first);
     _events.add((id, f));
   }
@@ -171,12 +172,15 @@ class ImageHub {
   /// Synchronous lookup of an already produced file (avoids a placeholder
   /// flash when a list item is rebuilt). The index is authoritative: the hub
   /// owns every write/delete, and decode errors self-heal via the widget.
-  File? peek(String url, int tier, {String? cacheKey}) =>
-      _known[_id(keyOf(url, cacheKey), 'b$tier')];
+  ({File file, bool svg})? peek(String url, int tier, {String? cacheKey}) {
+    final key = keyOf(url, cacheKey);
+    final hit = _known[_id(key, 'svg')] ?? _known[_id(key, 'b$tier')];
+    return hit == null ? null : (file: hit.$1, svg: hit.$2);
+  }
 
   /// The cached XS preview file, if any.
   File? peekXs(String url, {String? cacheKey}) =>
-      _known[_id(keyOf(url, cacheKey), 'xs')];
+      _known[_id(keyOf(url, cacheKey), 'xs')]?.$1;
 
   /// Drops a (possibly corrupt) cached file so the next request rebuilds it.
   Future<void> invalidate(String url, int tier, {String? cacheKey}) async {
@@ -186,6 +190,11 @@ class ImageHub {
   /// Drops the cached XS preview file.
   Future<void> invalidateXs(String url, {String? cacheKey}) async {
     await _invalidateVariant(keyOf(url, cacheKey), 'xs');
+  }
+
+  /// Drops the cached SVG file.
+  Future<void> invalidateSvg(String url, {String? cacheKey}) async {
+    await _invalidateVariant(keyOf(url, cacheKey), 'svg');
   }
 
   Future<void> _invalidateVariant(String key, String variant) async {
@@ -210,7 +219,10 @@ class ImageHub {
     final failed = _failures[id];
     if (failed != null) {
       if (DateTime.now().difference(failed.$1) < failureTtl) {
-        return ImageRequest._(Future<File>.error(failed.$2)..ignore(), () {});
+        return ImageRequest._(
+          Future<({File file, bool svg})>.error(failed.$2)..ignore(),
+          () {},
+        );
       }
       _failures.remove(id);
     }
@@ -264,12 +276,17 @@ class ImageHub {
     }
   }
 
-  Future<File> _run(_Job job) async {
+  Future<({File file, bool svg})> _run(_Job job) async {
+    final svgHit = await cache.get(job.key, 'svg');
+    if (svgHit != null) {
+      _remember(_id(job.key, 'svg'), svgHit, svg: true);
+      return (file: svgHit, svg: true);
+    }
     final variant = 'b${job.tier}';
     final hit = await cache.get(job.key, variant);
     if (hit != null) {
       _remember(_id(job.key, variant), hit);
-      return hit;
+      return (file: hit, svg: false);
     }
 
     // Lazy: reuse the *nearest* larger cached tier as source, else download.
@@ -278,9 +295,12 @@ class ImageHub {
       final f = await cache.get(job.key, v);
       if (f == null) continue;
       try {
-        return await _process(job, f, [
-          for (var x = i - 1; x >= job.tier; x--) 'b$x',
-        ]);
+        return (
+          file: await _process(job, f, [
+            for (var x = i - 1; x >= job.tier; x--) 'b$x',
+          ]),
+          svg: false,
+        );
       } catch (_) {
         await _invalidateVariant(
           job.key,
@@ -298,9 +318,17 @@ class ImageHub {
       );
       try {
         await _downloader.download(job.url, temp, refresher: job.refresher);
-        return await _process(job, temp, [
-          for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
-        ]);
+        if (await _looksSvg(temp)) {
+          final f = await cache.adopt(job.key, 'svg', temp);
+          _remember(_id(job.key, 'svg'), f, svg: true);
+          return (file: f, svg: true);
+        }
+        return (
+          file: await _process(job, temp, [
+            for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
+          ]),
+          svg: false,
+        );
       } on CorruptImageException {
         if (attempt == 1) rethrow;
       } finally {
@@ -315,6 +343,14 @@ class ImageHub {
   /// preview is encoded first so it reaches listeners as early as possible.
   Future<File> _process(_Job job, File source, List<String> steps) async {
     final srcSize = await _resizer.dimensions(source);
+    if (srcSize.width < 4 || srcSize.height < 4) {
+      // A download that decodes to a handful of pixels (truncated transfer or
+      // a CDN mitigation pixel) is corrupt for our purposes — retry/fail
+      // rather than caching a stretched flat color for a month.
+      throw CorruptImageException(
+        'implausibly small source ${srcSize.width.round()}x${srcSize.height.round()}',
+      );
+    }
     if (srcSize.width * srcSize.height > maxPixels) {
       throw ImageTooLargeException(
         '${srcSize.width.round()}x${srcSize.height.round()} exceeds $maxPixels pixels',
@@ -358,3 +394,33 @@ class _Cancelled implements Exception {
 }
 
 bool isCancelled(Object e) => e is _Cancelled;
+
+/// Sniffs the first 512 bytes of [f]: content containing an `<svg>` tag —
+/// after rejecting known raster magic bytes — bypasses the raster pipeline
+/// and is cached/rendered as a vector instead.
+Future<bool> _looksSvg(File f) async {
+  try {
+    final raf = await f.open();
+    try {
+      final head = await raf.read(512);
+      if (head.length < 4) return false;
+      // Reject known raster magics first.
+      const magics = [
+        [0xFF, 0xD8], // jpeg
+        [0x89, 0x50], // png
+        [0x47, 0x49], // gif
+        [0x52, 0x49], // riff/webp
+        [0x42, 0x4D], // bmp
+      ];
+      for (final m in magics) {
+        if (head[0] == m[0] && head[1] == m[1]) return false;
+      }
+      final text = String.fromCharCodes(head);
+      return RegExp(r'<svg[\s/>]').hasMatch(text);
+    } finally {
+      await raf.close();
+    }
+  } catch (_) {
+    return false;
+  }
+}

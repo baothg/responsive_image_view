@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+/// Called when a download is rejected for auth/expiry reasons (401/403) to
+/// obtain a fresh url for the same resource. Return null to give up.
 typedef UrlRefresher = Future<String?> Function(String expiredUrl);
 
 class DownloadException implements Exception {
@@ -11,6 +13,18 @@ class DownloadException implements Exception {
   String toString() => 'DownloadException($statusCode): $message';
 }
 
+/// The image resource does not exist (404) or was permanently removed (410).
+/// Never retried and never passed to [UrlRefresher] — unlike 401/403, a fresh
+/// url cannot bring back a missing resource.
+class ImageNotFoundException extends DownloadException {
+  ImageNotFoundException(int statusCode, {this.url})
+    : super('HTTP $statusCode', statusCode);
+  final String? url;
+  @override
+  String toString() =>
+      'ImageNotFoundException($statusCode): ${url ?? 'not found'}';
+}
+
 /// The image exceeds the configured byte or pixel limit. Never retried.
 class ImageTooLargeException implements Exception {
   ImageTooLargeException(this.message);
@@ -19,8 +33,9 @@ class ImageTooLargeException implements Exception {
   String toString() => 'ImageTooLargeException: $message';
 }
 
-/// Streams a url to [target]. Retries network/5xx errors with backoff; for
-/// expired-link statuses (401/403/404/410) asks [refresher] for a fresh url.
+/// Streams a url to [target]. Retries network/5xx errors with backoff; asks
+/// [refresher] for a fresh url on auth-expiry (401/403). Missing resources
+/// (404/410) fail fast as [ImageNotFoundException].
 class Downloader {
   Downloader({
     HttpClient? client,
@@ -40,7 +55,7 @@ class Downloader {
   final Duration perDownloadTimeout;
   final Duration retryDelay;
 
-  static bool _expired(int s) => s == 401 || s == 403 || s == 404 || s == 410;
+  static bool _authExpired(int s) => s == 401 || s == 403;
 
   Future<void> download(
     String url,
@@ -56,7 +71,10 @@ class Downloader {
       } on DownloadException catch (e) {
         last = e;
         final code = e.statusCode;
-        if (code != null && _expired(code)) {
+        if (code == 404 || code == 410) {
+          throw ImageNotFoundException(code!, url: current);
+        }
+        if (code != null && _authExpired(code)) {
           final fresh = refresher == null ? null : await refresher(url);
           if (fresh == null) rethrow;
           current = fresh;
