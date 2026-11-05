@@ -25,6 +25,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.cacheKey,
     this.urlResolver,
     this.localFile,
+    this.localSource,
   }) : assert(
          url != '' || urlResolver == null || cacheKey != null,
          'urlResolver without a url requires cacheKey as the cache identity',
@@ -48,6 +49,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.showOriginalImage = false,
     this.urlRefresher,
     this.localFile,
+    this.localSource,
   }) : url = '';
 
   final String url;
@@ -64,6 +66,14 @@ class ResponsiveImageView extends StatefulWidget {
   /// deleted to free storage (never when it is the same path as the loaded
   /// target).
   final File? localFile;
+
+  /// A local file that IS this url's content (e.g. the photo just uploaded
+  /// under it). It is used as the pipeline source — no download happens —
+  /// and shown as the placeholder like [localFile]. If it cannot be used
+  /// (missing, undecodable) the widget falls back to a real download.
+  /// WARNING: only set when the file really is the url's content — a wrong
+  /// file poisons the cache until expiry.
+  final File? localSource;
   final double? width;
   final double? height;
   final BoxFit? fit;
@@ -161,7 +171,7 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   /// The local placeholder file when it exists and has not failed to decode.
   File? _local() {
     if (_localFailed) return null;
-    final f = widget.localFile;
+    final f = widget.localFile ?? widget.localSource;
     if (f == null) return null;
     return (_localOk ??= f.existsSync()) ? f : null;
   }
@@ -177,13 +187,15 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   @override
   void didUpdateWidget(covariant ResponsiveImageView old) {
     super.didUpdateWidget(old);
-    if (old.localFile != widget.localFile) {
+    if (old.localFile != widget.localFile ||
+        old.localSource != widget.localSource) {
       _localOk = null;
       _localFailed = false;
     }
     if (old.url != widget.url ||
         old.cacheKey != widget.cacheKey ||
         old.urlResolver != widget.urlResolver ||
+        old.localSource != widget.localSource ||
         old.showOriginalImage != widget.showOriginalImage) {
       _resolvedUrl = null;
       _resolving = null;
@@ -234,8 +246,13 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       return;
     }
     if (_preview == null) {
-      // Largest already-cached variant (bN, else xs) as the preview.
-      final pv = hub.peekBestPreview(widget.url, cacheKey: widget.cacheKey);
+      // Smallest already-cached variant that is still sufficient for the
+      // target tier (else the largest smaller one, else xs).
+      final pv = hub.peekBestPreview(
+        widget.url,
+        original ? hub.scheme.count : tier,
+        cacheKey: widget.cacheKey,
+      );
       _preview = pv?.file;
       _previewVariant = pv?.variant;
     }
@@ -257,6 +274,10 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final known = widget.url.isNotEmpty ? widget.url : _resolvedUrl;
     if (known != null && known.isNotEmpty) {
       _issueRequest(hub, known, tier, screenPx, original);
+    } else if (widget.localSource != null && widget.urlResolver != null) {
+      // Defer resolution into the job: the local source may satisfy the
+      // whole request — the resolver then never runs at all.
+      _issueRequest(hub, '', tier, screenPx, original);
     } else if (widget.urlResolver != null) {
       // Lazy: the resolver only runs on a cache miss.
       if (_resolving == null) {
@@ -305,12 +326,14 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
       tier,
       screenPx,
       cacheKey: widget.cacheKey,
+      localSource: widget.localSource,
       // The resolver doubles as the refresher: re-invoking it is exactly
       // "give me a fresh url for this identity".
       refresher:
           widget.urlRefresher ??
           (resolver == null ? null : (_) => Future<String?>.value(resolver())),
       original: original,
+      urlResolver: widget.urlResolver,
     );
     req.future.then(
       (r) {
@@ -363,9 +386,10 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     _notifiedFor = _loadedFor;
     // The network image renders now — release the local placeholder's
     // storage. Guarded so a file that *is* the cached target is kept.
-    final local = widget.localFile;
-    if (local != null && local.path != f.path) {
-      unawaited(local.delete().catchError((_) => local));
+    for (final local in {widget.localFile, widget.localSource}) {
+      if (local != null && local.path != f.path) {
+        unawaited(local.delete().catchError((_) => local));
+      }
     }
     final cb = widget.onLoaded;
     if (cb == null) return;
@@ -446,10 +470,11 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
         );
       }
       // Best-effort preview on the first frame, before measurement lands:
-      // show the largest cached variant instead of a bare skeleton.
+      // show the smallest sufficient cached variant instead of a skeleton.
       if (_preview == null) {
         final pv = ImageHub.instance.peekBestPreview(
           widget.url,
+          ImageHub.instance.scheme.count,
           cacheKey: widget.cacheKey,
         );
         _preview = pv?.file;
@@ -559,11 +584,9 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
               height: h,
               fit: widget.fit,
               alignment: widget.alignment,
-              cacheWidth:
-                  (mw ?? _measuredSize?.width ?? screen.width) * dpr > 0
-                      ? ((mw ?? _measuredSize?.width ?? screen.width) * dpr)
-                          .round()
-                      : null,
+              cacheWidth: (mw ?? _measuredSize?.width ?? screen.width) * dpr > 0
+                  ? ((mw ?? _measuredSize?.width ?? screen.width) * dpr).round()
+                  : null,
               gaplessPlayback: true,
               errorBuilder: (_, _, _) {
                 // Missing/corrupt local file: fall back to the normal

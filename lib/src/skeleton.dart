@@ -24,10 +24,9 @@ class _SharedShimmer {
   static Animation<double> acquire(Duration period) {
     _users++;
     return _controller ??= AnimationController(
-        vsync: const _SharedTicker(),
-        duration: period,
-      )
-      ..repeat();
+      vsync: const _SharedTicker(),
+      duration: period,
+    )..repeat();
   }
 
   static void release() {

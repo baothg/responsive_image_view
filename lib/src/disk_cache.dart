@@ -17,6 +17,12 @@ class DiskCache {
 
   final Duration maxAge;
   final int maxBytes;
+
+  /// Bytes written since the last [resetWrittenBytes] — drives the
+  /// hub's mid-session quota guard.
+  int writtenBytes = 0;
+
+  void resetWrittenBytes() => writtenBytes = 0;
   Directory? _dir;
   Future<Directory>? _init;
 
@@ -83,11 +89,19 @@ class DiskCache {
     }
   }
 
-  /// Atomically adopts [file] as a variant (rename within the same
-  /// directory — no extra read/copy, useful for large files).
+  /// Adopts [file] as a variant — an atomic rename within the same
+  /// directory when possible, else a copy+delete (cross-volume sources
+  /// like a caller-supplied local file).
   Future<File> adopt(String key, String variant, File file) async {
     final f = await fileFor(key, variant);
-    return file.rename(f.path);
+    writtenBytes += await file.length();
+    try {
+      return await file.rename(f.path);
+    } on FileSystemException {
+      final out = await f.writeAsBytes(await file.readAsBytes());
+      await file.delete().catchError((_) => file);
+      return out;
+    }
   }
 
   /// Atomically stores [bytes].
@@ -95,6 +109,7 @@ class DiskCache {
     final f = await fileFor(key, variant);
     final tmp = File('${f.path}.tmp');
     await tmp.writeAsBytes(bytes, flush: true);
+    writtenBytes += bytes.length;
     return tmp.rename(f.path);
   }
 

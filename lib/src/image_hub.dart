@@ -23,6 +23,8 @@ class _Job {
     this.screenPx,
     this.refresher,
     this.original,
+    this.localSource,
+    this.urlResolver,
   ) : variant = original ? 'org' : 'b$tier';
   final String key;
   final String url;
@@ -35,6 +37,14 @@ class _Job {
 
   /// Cache variant this job produces ('org' or `bN`).
   final String variant;
+
+  /// A local file the caller guarantees IS this url's content — used as
+  /// the pipeline source on the first attempt instead of downloading.
+  final File? localSource;
+
+  /// Resolves [url] on demand when it is empty — deferred all the way to
+  /// the download step so a satisfied local source never costs an api call.
+  final FutureOr<String?> Function()? urlResolver;
   final completer = Completer<({File file, bool svg})>()..future.ignore();
   int listeners = 0;
   bool started = false;
@@ -164,14 +174,33 @@ class ImageHub {
   /// the first frame of a new session.
   Future<void> _warmUp() async {
     try {
-      for (final f in await cache.cleanup()) {
-        final name = f.uri.pathSegments.last;
-        if (name.endsWith('.img')) {
-          final id = name.substring(0, name.length - 4);
-          _remember(id, f, svg: id.endsWith('_svg'));
-        }
-      }
+      _indexFiles(await cache.cleanup());
     } catch (_) {}
+  }
+
+  void _indexFiles(List<File> files) {
+    for (final f in files) {
+      final name = f.uri.pathSegments.last;
+      if (name.endsWith('.img')) {
+        final id = name.substring(0, name.length - 4);
+        _remember(id, f, svg: id.endsWith('_svg'));
+      }
+    }
+  }
+
+  /// Mid-session quota guard: after enough new bytes, sweep expired/oldest
+  /// entries once the job queue is idle and re-index survivors so peek
+  /// stays consistent (deleted files must not be served).
+  void _maybeCleanup() {
+    if (_running > 0 || _queue.isNotEmpty) return;
+    if (cache.writtenBytes <= cache.maxBytes ~/ 5) return;
+    cache.resetWrittenBytes();
+    unawaited(
+      cache.cleanup().then((survivors) {
+        _known.clear();
+        _indexFiles(survivors);
+      }),
+    );
   }
 
   void _remember(String id, File f, {bool svg = false}) {
@@ -199,14 +228,22 @@ class ImageHub {
   File? peekXs(String url, {String? cacheKey}) =>
       _known[_id(keyOf(url, cacheKey), 'xs')]?.$1;
 
-  /// The best already-cached preview for progressive display: the largest
-  /// available bucket variant, else the XS preview.
+  /// The best already-cached preview for [tier]: the smallest variant that
+  /// is still sufficient (minimal file that is >= the target — matching the
+  /// lib's never-load-bigger-than-needed rule), else the largest smaller
+  /// variant, else the XS preview. Pass [BucketScheme.count] for the
+  /// unbounded original request.
   ({File file, String variant})? peekBestPreview(
-    String url, {
+    String url,
+    int tier, {
     String? cacheKey,
   }) {
     final key = keyOf(url, cacheKey);
-    for (var i = scheme.count - 1; i >= 0; i--) {
+    for (var i = tier; i < scheme.count; i++) {
+      final f = _known[_id(key, 'b$i')];
+      if (f != null) return (file: f.$1, variant: 'b$i');
+    }
+    for (var i = tier - 1; i >= 0; i--) {
       final f = _known[_id(key, 'b$i')];
       if (f != null) return (file: f.$1, variant: 'b$i');
     }
@@ -265,6 +302,8 @@ class ImageHub {
     String? cacheKey,
     UrlRefresher? refresher,
     bool original = false,
+    File? localSource,
+    FutureOr<String?> Function()? urlResolver,
   }) {
     final key = keyOf(url, cacheKey);
     final id = _id(key, original ? 'org' : 'b$tier');
@@ -280,7 +319,16 @@ class ImageHub {
     }
     _used = true;
     final job = _jobs.putIfAbsent(id, () {
-      final j = _Job(key, url, tier, screenPx, refresher, original);
+      final j = _Job(
+        key,
+        url,
+        tier,
+        screenPx,
+        refresher,
+        original,
+        localSource,
+        urlResolver,
+      );
       _queue.add(j);
       scheduleMicrotask(_pump);
       return j;
@@ -324,6 +372,7 @@ class ImageHub {
             _running--;
             _runningKeys.remove(job.key);
             _pump();
+            _maybeCleanup();
           });
     }
   }
@@ -384,32 +433,49 @@ class ImageHub {
       }
     }
 
-    // Retry once when the download decoded as corrupt (e.g. a truncated
-    // transfer that closed cleanly).
+    // The local source, when supplied and readable, replaces the first
+    // download attempt entirely. Any failure on it falls back to a real
+    // download; a corrupt download also gets one retry.
     for (var attempt = 0; attempt < 2; attempt++) {
-      final temp = await cache.tempFile(
-        '${job.key}_${DateTime.now().microsecondsSinceEpoch}',
-      );
+      File? temp;
+      var usedLocal = false;
       try {
-        await _downloader.download(job.url, temp, refresher: job.refresher);
-        if (await _looksSvg(temp)) {
-          final f = await cache.adopt(job.key, 'svg', temp);
+        File source;
+        final local = job.localSource;
+        if (attempt == 0 && local != null && await local.exists()) {
+          source = local;
+          usedLocal = true;
+        } else {
+          temp = await cache.tempFile(
+            '${job.key}_${DateTime.now().microsecondsSinceEpoch}',
+          );
+          await _downloader.download(job.url, temp, refresher: job.refresher);
+          source = temp;
+        }
+        if (await _looksSvg(source)) {
+          final f = await cache.adopt(job.key, 'svg', source);
           _remember(_id(job.key, 'svg'), f, svg: true);
           return (file: f, svg: true);
         }
         if (job.original) {
-          return (file: await _adoptOriginal(job, temp), svg: false);
+          return (file: await _adoptOriginal(job, source), svg: false);
         }
         return (
-          file: await _process(job, temp, [
+          file: await _process(job, source, [
             for (var x = scheme.count - 1; x >= job.tier; x--) 'b$x',
           ]),
           svg: false,
         );
-      } on CorruptImageException {
+      } catch (e) {
+        // Local-source failures always retry with a real download; a
+        // corrupt download retries once. Everything else is definitive.
         if (attempt == 1) rethrow;
+        if (usedLocal || e is CorruptImageException) continue;
+        rethrow;
       } finally {
-        await temp.delete().catchError((_) => temp);
+        if (temp != null) {
+          await temp.delete().catchError((_) => temp!);
+        }
       }
     }
     throw StateError('unreachable');

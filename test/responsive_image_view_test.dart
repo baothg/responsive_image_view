@@ -761,12 +761,133 @@ void main() {
       );
       // _warmUp indexes existing files.
       await Future<void>.delayed(const Duration(milliseconds: 50));
-      // b1 outranks both b0 and xs.
+      // Smallest sufficient for tier 2: none cached -> largest below (b1).
       expect(
-        hub.peekBestPreview('u', cacheKey: 'bp')!.file.path,
+        hub.peekBestPreview('u', 2, cacheKey: 'bp')!.file.path,
         endsWith('_b1.img'),
       );
+      // Smallest sufficient for tier 0 is b0 itself, not the larger b1.
+      expect(
+        hub.peekBestPreview('u', 0, cacheKey: 'bp')!.file.path,
+        endsWith('_b0.img'),
+      );
     });
+
+    test('localSource seeds the pipeline without downloading', () async {
+      final cache = DiskCache(directory: dir);
+      final dl = _RawDownloader(utf8.encode('should-not-be-read'));
+      final rs = _FakeResizer();
+      final hub = ImageHub(cache: cache, downloader: dl, resizer: rs);
+      final local = File('${dir.path}/ls.png')..writeAsBytesSync([7, 7, 7]);
+      const px = Size(1200, 2400);
+      final r = await hub
+          .request('u', 0, px, cacheKey: 'ls', localSource: local)
+          .future;
+      expect(r.svg, isFalse);
+      expect(dl.calls, 0); // nothing was downloaded
+      // The bucket was processed FROM the local file.
+      expect(rs.sources, isNotEmpty);
+      expect(rs.sources.first, local.path);
+      final key = DiskCache.hash('ls');
+      expect(await cache.get(key, 'b0'), isNotNull);
+      expect(hub.peek('u', 0, cacheKey: 'ls'), isNotNull);
+    });
+
+    test('unusable localSource falls back to a real download', () async {
+      final cache = DiskCache(directory: dir);
+      final dl = _RawDownloader(utf8.encode('downloaded'));
+      final rs = _FakeResizer();
+      final hub = ImageHub(cache: cache, downloader: dl, resizer: rs);
+      // First byte 0 -> dimensions() throws UnsupportedImageException for
+      // this fake, exercising the fallback path.
+      final local = File('${dir.path}/bad.png')..writeAsBytesSync([0, 0]);
+      const px = Size(1200, 2400);
+      final r = await hub
+          .request('u', 0, px, cacheKey: 'lf', localSource: local)
+          .future;
+      expect(r.svg, isFalse);
+      expect(dl.calls, 1); // real download ran after the local failed
+      expect(rs.sources.first, isNot(local.path));
+    });
+
+    test('missing localSource file falls back to a real download', () async {
+      final cache = DiskCache(directory: dir);
+      final dl = _RawDownloader(utf8.encode('downloaded'));
+      final hub = ImageHub(
+        cache: cache,
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      const px = Size(1200, 2400);
+      final r = await hub
+          .request(
+            'u',
+            0,
+            px,
+            cacheKey: 'lm',
+            localSource: File('/nonexistent/x.png'),
+          )
+          .future;
+      expect(r.svg, isFalse);
+      expect(dl.calls, 1);
+    });
+
+    test('localSource svg is adopted as the svg variant', () async {
+      final cache = DiskCache(directory: dir);
+      final dl = _RawDownloader(utf8.encode('should-not-be-read'));
+      final hub = ImageHub(
+        cache: cache,
+        downloader: dl,
+        resizer: _FakeResizer(),
+      );
+      final local = File('${dir.path}/a.svg')
+        ..writeAsBytesSync(utf8.encode(_svgBody));
+      const px = Size(1200, 2400);
+      final r = await hub
+          .request(
+            'u',
+            0,
+            px,
+            cacheKey: 'lsvg',
+            localSource: local,
+            original: true,
+          )
+          .future;
+      expect(r.svg, isTrue);
+      expect(dl.calls, 0);
+    });
+
+    test(
+      'localSource satisfies a lazy request without resolving the url',
+      () async {
+        final cache = DiskCache(directory: dir);
+        final dl = _RawDownloader(utf8.encode('should-not-be-read'));
+        final hub = ImageHub(
+          cache: cache,
+          downloader: dl,
+          resizer: _FakeResizer(),
+        );
+        var resolves = 0;
+        final local = File('${dir.path}/lz.png')..writeAsBytesSync([7, 7, 7]);
+        const px = Size(1200, 2400);
+        final r = await hub
+            .request(
+              '',
+              0,
+              px,
+              cacheKey: 'lz',
+              localSource: local,
+              urlResolver: () async {
+                resolves++;
+                return 'http://x/late.jpg';
+              },
+            )
+            .future;
+        expect(r.svg, isFalse);
+        expect(resolves, 0); // resolution deferred and never needed
+        expect(dl.calls, 0);
+      },
+    );
 
     test('cancelled queued job is dropped', () async {
       final dl = _FakeDownloader();
