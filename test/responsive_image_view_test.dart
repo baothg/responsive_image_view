@@ -1379,4 +1379,157 @@ void main() {
     expect(errors, greaterThan(0));
     expect(t.takeException(), isNull);
   });
+
+  testWidgets(
+    'localFile is shown while loading and deleted once the target renders',
+    (t) async {
+      final dir = Directory.systemTemp.createTempSync('ri_loc');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final png = img.encodePng(img.Image(width: 8, height: 8));
+      final local = File('${dir.path}/shot.png')..writeAsBytesSync(png);
+      // Target already cached: the widget resolves it in the first build,
+      // then the decoded frame frees the local placeholder.
+      final key = DiskCache.hash('loc-key');
+      final cache = DiskCache(directory: dir);
+      await t.runAsync(() => cache.put(key, 'b0', png));
+      late ImageHub hub;
+      await t.runAsync(() async {
+        hub = ImageHub(cache: cache, downloader: _FailingDownloader());
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      ImageHub.instance = hub;
+      await t.runAsync(() async {
+        await t.pumpWidget(
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: SizedBox(
+              width: 72,
+              height: 72,
+              child: ResponsiveImageView(
+                'http://x/n.jpg',
+                cacheKey: 'loc-key',
+                width: 72,
+                height: 72,
+                localFile: local,
+              ),
+            ),
+          ),
+        );
+        await t.pump();
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        await t.pump();
+      });
+      await t.pump();
+      expect(find.byType(Image), findsOneWidget);
+      expect(local.existsSync(), isFalse); // freed once the target rendered
+      expect(t.takeException(), isNull);
+    },
+  );
+
+  testWidgets('localFile renders while the target is still loading', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_loc3');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final png = img.encodePng(img.Image(width: 8, height: 8));
+    final local = File('${dir.path}/shot.png')..writeAsBytesSync(png);
+    late ImageHub hub;
+    await t.runAsync(() async {
+      hub = ImageHub(
+        cache: DiskCache(directory: dir),
+        downloader: _FakeDownloader(), // slow write -> request in flight
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    ImageHub.instance = hub;
+    await t.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: SizedBox(
+          width: 72,
+          height: 72,
+          child: ResponsiveImageView(
+            'http://x/n.jpg',
+            cacheKey: 'loc-key2',
+            width: 72,
+            height: 72,
+            localFile: local,
+          ),
+        ),
+      ),
+    );
+    await t.pump();
+    final image = t.widget<Image>(find.byType(Image));
+    final provider = image.image is ResizeImage
+        ? (image.image as ResizeImage).imageProvider
+        : image.image;
+    expect((provider as FileImage).file.path, local.path);
+    expect(find.byType(ResponsiveImageSkeleton), findsNothing);
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets('missing localFile falls back to the skeleton', (t) async {
+    ImageHub.instance = ImageHub(
+      cache: DiskCache(
+        directory: Directory.systemTemp.createTempSync('ri_loc2')
+          ..deleteSync(recursive: true),
+      ),
+      downloader: _FailingDownloader(),
+    );
+    await t.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: SizedBox(
+          width: 72,
+          height: 72,
+          child: ResponsiveImageView(
+            'http://x/m.jpg',
+            cacheKey: 'loc-miss',
+            width: 72,
+            height: 72,
+            localFile: File('/definitely/not/here.png'),
+          ),
+        ),
+      ),
+    );
+    await t.pump();
+    expect(find.byType(Image), findsNothing);
+    expect(find.byType(ResponsiveImageSkeleton), findsOneWidget);
+    expect(t.takeException(), isNull);
+  });
+
+  testWidgets('undecodable localFile falls back to the skeleton', (t) async {
+    final dir = Directory.systemTemp.createTempSync('ri_loc4');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final local = File('${dir.path}/bad.png')
+      ..writeAsBytesSync([9, 9, 9, 9, 9, 9, 9, 9]);
+    ImageHub.instance = ImageHub(
+      cache: DiskCache(directory: dir),
+      downloader: _FailingDownloader(),
+    );
+    await t.runAsync(() async {
+      await t.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: ResponsiveImageView(
+              'http://x/m.jpg',
+              cacheKey: 'loc-bad',
+              width: 72,
+              height: 72,
+              localFile: local,
+            ),
+          ),
+        ),
+      );
+      await t.pump();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await t.pump();
+    });
+    // errorBuilder -> post-frame setState -> skeleton on the next frame.
+    await t.pump();
+    await t.pump();
+    expect(find.byType(ResponsiveImageSkeleton), findsOneWidget);
+    expect(t.takeException(), isNull);
+  });
 }

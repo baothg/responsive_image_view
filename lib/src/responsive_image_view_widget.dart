@@ -24,6 +24,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.urlRefresher,
     this.cacheKey,
     this.urlResolver,
+    this.localFile,
   }) : assert(
          url != '' || urlResolver == null || cacheKey != null,
          'urlResolver without a url requires cacheKey as the cache identity',
@@ -46,6 +47,7 @@ class ResponsiveImageView extends StatefulWidget {
     this.onLoaded,
     this.showOriginalImage = false,
     this.urlRefresher,
+    this.localFile,
   }) : url = '';
 
   final String url;
@@ -54,6 +56,14 @@ class ResponsiveImageView extends StatefulWidget {
   /// needed. With [cacheKey] set, cache hits never call it. When
   /// [urlRefresher] is absent it also serves as the 401/403 fallback.
   final FutureOr<String?> Function()? urlResolver;
+
+  /// A local file shown as the placeholder until the network image's first
+  /// frame decodes — e.g. a just-captured photo awaiting its uploaded copy.
+  /// Skipped entirely when missing or undecodable (falls back to the
+  /// preview/skeleton chain). Once the network image renders, the file is
+  /// deleted to free storage (never when it is the same path as the loaded
+  /// target).
+  final File? localFile;
   final double? width;
   final double? height;
   final BoxFit? fit;
@@ -145,6 +155,16 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   String? _resolvedUrl;
   Future<String?>? _resolving;
   Size? _measuredSize;
+  bool? _localOk;
+  bool _localFailed = false;
+
+  /// The local placeholder file when it exists and has not failed to decode.
+  File? _local() {
+    if (_localFailed) return null;
+    final f = widget.localFile;
+    if (f == null) return null;
+    return (_localOk ??= f.existsSync()) ? f : null;
+  }
 
   /// Preview quality rank: xs < b0 < b1 < ... — a produced variant only
   /// replaces the current preview when it is larger.
@@ -157,6 +177,10 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
   @override
   void didUpdateWidget(covariant ResponsiveImageView old) {
     super.didUpdateWidget(old);
+    if (old.localFile != widget.localFile) {
+      _localOk = null;
+      _localFailed = false;
+    }
     if (old.url != widget.url ||
         old.cacheKey != widget.cacheKey ||
         old.urlResolver != widget.urlResolver ||
@@ -337,7 +361,12 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
     final f = _file;
     if (f == null || _notifiedFor == _loadedFor) return;
     _notifiedFor = _loadedFor;
-    // ignore: avoid_print
+    // The network image renders now — release the local placeholder's
+    // storage. Guarded so a file that *is* the cached target is kept.
+    final local = widget.localFile;
+    if (local != null && local.path != f.path) {
+      unawaited(local.delete().catchError((_) => local));
+    }
     final cb = widget.onLoaded;
     if (cb == null) return;
     scheduleMicrotask(() {
@@ -521,6 +550,30 @@ class _ResponsiveImageViewState extends State<ResponsiveImageView> {
           }
           if (_error != null && widget.errorBuilder != null) {
             return widget.errorBuilder!(context, _error!, _retry);
+          }
+          final local = _local();
+          if (local != null) {
+            return Image.file(
+              local,
+              width: w,
+              height: h,
+              fit: widget.fit,
+              alignment: widget.alignment,
+              cacheWidth:
+                  (mw ?? _measuredSize?.width ?? screen.width) * dpr > 0
+                      ? ((mw ?? _measuredSize?.width ?? screen.width) * dpr)
+                          .round()
+                      : null,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) {
+                // Missing/corrupt local file: fall back to the normal
+                // preview/skeleton chain — post-frame, like other builders.
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) setState(() => _localFailed = true);
+                });
+                return const SizedBox.shrink();
+              },
+            );
           }
           if (_preview != null) {
             return Image.file(
